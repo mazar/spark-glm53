@@ -1,0 +1,11 @@
+[fetch_nvidia_ckpt] 2026-10-20T21:32:16-07:00 start nvidia/GLM-5.3-Flash-FP4-Local@76348ddb2be2e35e39ecfc00e75dc07703f4f3d5
+Downloading hf-xet (3.8MiB)
+ Downloaded hf-xet
+Installed 15 packages in 7ms
+warning: The package `huggingface-hub==2.2.0` does not have an extra named `hf-transfer`
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Running as unit: run-r8a5af427ed294bd784b5183824f69b0f.scope; invocation ID: 5f44f2e26bbb4963a18b48ce5655ecd4
+[fetch_nvidia_ckpt] 2026-10-20T21:32:47-07:00 start nvidia/GLM-5.3-Flash-FP4-Local@76348ddb2be2e35e39ecfc00e75dc07703f4f3d5
+Running as unit: run-red9b3bfc90b14348b6ba65b4df587315.scope; invocation ID: 8564dc06624f4520a8a95cd1db186741
+[fetch_nvidia_ckpt] 2026-10-20T21:34:26-07:00 start nvidia/GLM-5.3-Flash-FP4-Local@76348ddb2be2e35e39ecfc00e75dc07703f4f3d5
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.

@@ -86,7 +86,7 @@ HERMES_20_TOOLS = [
 ]
 
 
-def build_64k_context_messages() -> list[dict[str, Any]]:
+def build_64k_context_messages(nonce: str = "") -> list[dict[str, Any]]:
     """Build a ~64,000-token multi-file repository context with a pinned system prompt."""
     system_prompt = (
         "You are Spark-GLM53 Architect, an autonomous distributed systems engineering agent "
@@ -94,7 +94,7 @@ def build_64k_context_messages() -> list[dict[str, Any]]:
         "Answer questions concisely using exact facts from the repository context."
     )
     # Construct ~64,000 tokens of realistic structured code/telemetry blocks
-    sections = []
+    sections = [f"Repository snapshot {nonce}\n"] if nonce else []
     base_block = (
         "## Module section {i:04d}: DGX Spark GB10 UMA & Dual-Rail ConnectX-7 Architecture\n"
         "In subsystem module {i:04d}, the Grace Blackwell GB10 superchip connects 128 GiB of unified "
@@ -359,9 +359,76 @@ async def run_gate4_suite(gateway_url: str, model: str) -> dict[str, Any]:
         }
         print(f"    -> Hermes 20-tool result: {results['hermes_20_tool_gauntlet']}")
 
+        # 4b. Multi-step agent loop (honest-v1): one conversation, many sequential tool
+        # calls across different tools, with tool results fed back each step.
+        print("[4b/5] Running multi-step agent tool loop (8 sequential tool calls)...")
+        loop_steps = [
+            ("Check RoCE telemetry on node `spark-5a4e`, HCA `roceP2p1s0f1`.", "cluster_roce_status", ("node_hostname", "spark-5a4e")),
+            ("Now inspect the /dev/shm weight daemon on rank 0.", "shm_weight_daemon_inspect", ("rank", 0)),
+            ("Inspect the radix prefix tree including spilled blocks.", "kv_cache_radix_inspect", ("include_spilled_blocks", True)),
+            ("Run diagnostic tool 07 on subsystem `nvlink-c2c` with a 30 second window.", "hermes_diagnostic_tool_07", ("subsystem_id", "nvlink-c2c")),
+            ("Run diagnostic tool 12 on subsystem `lpddr5x-ecc`, verbose.", "hermes_diagnostic_tool_12", ("subsystem_id", "lpddr5x-ecc")),
+            ("Check RoCE telemetry on node `spark-8a27`, HCA `rocep1s0f1`, with PFC counters.", "cluster_roce_status", ("node_hostname", "spark-8a27")),
+            ("Run diagnostic tool 19 on subsystem `nvme-spill`.", "hermes_diagnostic_tool_19", ("subsystem_id", "nvme-spill")),
+            ("Inspect the /dev/shm weight daemon on rank 1 and verify mlock.", "shm_weight_daemon_inspect", ("rank", 1)),
+        ]
+        loop_msgs: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": "You are Hermes Agent controlling a 2x DGX Spark cluster. For every "
+                "user request, call exactly one matching tool with correct arguments.",
+            }
+        ]
+        loop_records = []
+        for step_i, (instr, exp_tool, (arg_k, arg_v)) in enumerate(loop_steps):
+            loop_msgs.append({"role": "user", "content": instr})
+            async with session.post(
+                f"{gateway_url}/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": loop_msgs,
+                    "tools": HERMES_20_TOOLS,
+                    "tool_choice": "auto",
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    "max_tokens": 192,
+                    "temperature": 0.0,
+                },
+            ) as r:
+                rj = await r.json()
+            msg = (rj.get("choices") or [{}])[0].get("message") or {}
+            tcs = msg.get("tool_calls") or []
+            name, args, args_ok = None, {}, False
+            if tcs:
+                name = tcs[0]["function"]["name"]
+                try:
+                    args = json.loads(tcs[0]["function"]["arguments"] or "{}")
+                    args_ok = True
+                except Exception:
+                    args_ok = False
+            correct = name == exp_tool and args_ok and args.get(arg_k) == arg_v
+            loop_records.append({"step": step_i, "expected": exp_tool, "called": name, "args": args, "correct": correct})
+            # Feed back assistant turn + a synthetic tool result so the loop continues.
+            if tcs:
+                tc_id = tcs[0].get("id") or f"call_{step_i}"
+                loop_msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": [
+                    {"id": tc_id, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+                ]})
+                loop_msgs.append({"role": "tool", "tool_call_id": tc_id, "content": json.dumps({"status": "ok", "step": step_i})})
+            else:
+                loop_msgs.append({"role": "assistant", "content": msg.get("content") or ""})
+        n_ok = sum(r["correct"] for r in loop_records)
+        results["agent_tool_loop"] = {
+            "steps": len(loop_records),
+            "correct": n_ok,
+            "accuracy": round(n_ok / len(loop_records), 3),
+            "records": loop_records,
+            "pass": n_ok >= int(0.9 * len(loop_records) + 0.999),
+        }
+        print(f"    -> Agent tool loop: {n_ok}/{len(loop_records)} correct")
+
         # 5. Multi-Turn 64K Prompt Reuse Test (Verify Turn 2 TTFT < 100 ms)
         print("[5/5] Running Multi-Turn 64K Prompt Reuse Test (Turn 1 prefill -> Turn 2 Radix Prefix Cache hit)...")
-        base_64k_msgs = build_64k_context_messages()
+        base_64k_msgs = build_64k_context_messages(nonce=f"run-{int(time.time())}")
         turn1_msgs = list(base_64k_msgs) + [
             {
                 "role": "user",
@@ -421,18 +488,18 @@ async def run_gate4_suite(gateway_url: str, model: str) -> dict[str, Any]:
         async with session.get(f"{gateway_url}/health") as r:
             final_health = await r.json()
 
-        best_reuse_ttft = min(turn2_res["ttft_ms"], turn3_res["ttft_ms"])
+        # honest-v1: the headline is the REAL second turn (new user message appended).
+        # Turn 3 is a byte-identical resend of turn 2 and is reported separately only.
         results["multi_turn_64k_reuse"] = {
             "turn1_ttft_ms": turn1_res["ttft_ms"],
             "turn1_answer": turn1_res["text"].strip(),
             "turn2_ttft_ms": turn2_res["ttft_ms"],
             "turn2_answer": turn2_res["text"].strip(),
             "turn2_radix_headers": turn2_res["headers"],
-            "turn3_ttft_ms": turn3_res["ttft_ms"],
-            "turn3_radix_headers": turn3_res["headers"],
-            "best_reuse_ttft_ms": best_reuse_ttft,
+            "exact_resend_ttft_ms": turn3_res["ttft_ms"],
+            "exact_resend_radix_headers": turn3_res["headers"],
             "canary_preserved": "SPARK-GATE4-RADIX-64K-OK-9942" in turn2_res["text"],
-            "pass_sub_100ms": best_reuse_ttft < 100.0,
+            "pass_turn2_sub_100ms": turn2_res["ttft_ms"] < 100.0,
             "gateway_radix_stats": final_health.get("radix_prefix_router"),
         }
 
@@ -443,7 +510,13 @@ async def run_gate4_suite(gateway_url: str, model: str) -> dict[str, Any]:
         and results["dual_api_compatibility"]["anthropic_stream_ok"]
         and results["hermes_20_tool_gauntlet"]["pass"]
         and results["multi_turn_64k_reuse"]["canary_preserved"]
-        and results["multi_turn_64k_reuse"]["pass_sub_100ms"]
+        and results["multi_turn_64k_reuse"]["pass_turn2_sub_100ms"]
+        and results["agent_tool_loop"]["pass"]
+    )
+    results["methodology"] = (
+        "honest-v1: turn-2 TTFT is the headline (no min() with an exact resend); "
+        "64K context carries a per-run nonce so turn 1 is a cold prefill; "
+        "agent_tool_loop requires >=90% correct sequential tool calls."
     )
     return results
 

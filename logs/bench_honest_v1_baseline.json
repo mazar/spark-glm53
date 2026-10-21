@@ -1,0 +1,175 @@
+{
+  "timestamp": "2026-10-20T21:36:44-0700",
+  "base_url": "http://127.0.0.1:8000",
+  "run_id": "r1792557404",
+  "methodology": "honest-v1 (PLAN.md D1/D3): unique prompts per run, distinct prompts per stream, identical-prompt numbers reported only as best_case_*",
+  "kv_cache": {
+    "kv_cache_tokens": 2263389,
+    "kv_cache_gib": 15.65,
+    "warm_load_sec": 1.517,
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "all_kv_groups_tokens": [
+      2263389
+    ]
+  },
+  "prefill_8k": {
+    "prompt_tokens": 8057,
+    "completion_tokens": 1,
+    "ttft_sec": 4.5289,
+    "decode_sec": 0.0,
+    "total_sec": 4.5292,
+    "prefill_tok_per_s": 1779.03,
+    "decode_tok_per_s": 1000000.0
+  },
+  "prefill_32k": {
+    "prompt_tokens": 32151,
+    "completion_tokens": 1,
+    "ttft_sec": 17.9034,
+    "decode_sec": 0.0,
+    "total_sec": 17.9039,
+    "prefill_tok_per_s": 1795.8,
+    "decode_tok_per_s": 1000000.0
+  },
+  "decode_1stream_prose": {
+    "mean_decode_tok_per_s": 18.58,
+    "runs": [
+      {
+        "prompt_tokens": 96,
+        "completion_tokens": 512,
+        "ttft_sec": 0.5384,
+        "decode_sec": 27.6185,
+        "total_sec": 28.1577,
+        "prefill_tok_per_s": 178.31,
+        "decode_tok_per_s": 18.5
+      },
+      {
+        "prompt_tokens": 83,
+        "completion_tokens": 512,
+        "ttft_sec": 0.5481,
+        "decode_sec": 26.7956,
+        "total_sec": 27.3445,
+        "prefill_tok_per_s": 151.43,
+        "decode_tok_per_s": 19.07
+      },
+      {
+        "prompt_tokens": 84,
+        "completion_tokens": 512,
+        "ttft_sec": 0.6535,
+        "decode_sec": 28.1344,
+        "total_sec": 28.7884,
+        "prefill_tok_per_s": 128.54,
+        "decode_tok_per_s": 18.16
+      }
+    ]
+  },
+  "decode_1stream_code": {
+    "mean_decode_tok_per_s": 34.45,
+    "runs": [
+      {
+        "prompt_tokens": 1219,
+        "completion_tokens": 512,
+        "ttft_sec": 1.3279,
+        "decode_sec": 15.178,
+        "total_sec": 16.5065,
+        "prefill_tok_per_s": 917.99,
+        "decode_tok_per_s": 33.67
+      },
+      {
+        "prompt_tokens": 1236,
+        "completion_tokens": 512,
+        "ttft_sec": 1.3346,
+        "decode_sec": 14.5086,
+        "total_sec": 15.8438,
+        "prefill_tok_per_s": 926.11,
+        "decode_tok_per_s": 35.22
+      }
+    ]
+  },
+  "decode_4stream_code_distinct": {
+    "parallel": 4,
+    "distinct_prompts": 4,
+    "total_completion_tokens": 2048,
+    "wall_sec": 41.471,
+    "aggregate_decode_tok_per_s": 53.19,
+    "aggregate_wall_tok_per_s": 49.38
+  },
+  "determinism_4stream_vs_serial": {
+    "exact_match_rate": 0.0,
+    "first_divergence_char": [
+      0,
+      110,
+      175,
+      338
+    ],
+    "avg_output_chars": 2028
+  },
+  "decode_8stream_code_distinct": {
+    "parallel": 8,
+    "distinct_prompts": 8,
+    "total_completion_tokens": 4096,
+    "wall_sec": 46.516,
+    "aggregate_decode_tok_per_s": 102.25,
+    "aggregate_wall_tok_per_s": 88.06
+  },
+  "best_case_8stream_identical_prompt": {
+    "parallel": 8,
+    "distinct_prompts": 1,
+    "total_completion_tokens": 4096,
+    "wall_sec": 41.818,
+    "aggregate_decode_tok_per_s": 105.88,
+    "aggregate_wall_tok_per_s": 97.95,
+    "all_streams_identical": false,
+    "note": "IDENTICAL prompt x8 \u2014 best case only, not used for pass/fail"
+  },
+  "quality": {
+    "gsm8k_n": 50,
+    "gsm8k_accuracy": 1.0,
+    "humaneval_n": 50,
+    "humaneval_pass_at_1": 0.94,
+    "gsm8k_failed_idx": [],
+    "humaneval_failed_ids": [
+      "HumanEval/38",
+      "HumanEval/39",
+      "HumanEval/40"
+    ],
+    "elapsed_sec": 208.1,
+    "settings": "temperature=0, enable_thinking=False, max_tokens=768, first-N slices"
+  },
+  "verdict": {
+    "prefill_8k_tok_per_s": {
+      "value": 1779.03,
+      "target": 3600.0,
+      "pass": false
+    },
+    "prefill_32k_tok_per_s": {
+      "value": 1795.8,
+      "target": 3600.0,
+      "pass": false
+    },
+    "decode_1stream_prose": {
+      "value": 18.58,
+      "target": 62.0,
+      "pass": false
+    },
+    "decode_1stream_code": {
+      "value": 34.45,
+      "target": 120.0,
+      "pass": false
+    },
+    "decode_8stream_code_distinct": {
+      "value": 88.06,
+      "target": 185.0,
+      "pass": false
+    },
+    "kv_cache_tokens": {
+      "value": 2263389,
+      "target": 2200000,
+      "pass": true
+    },
+    "warm_load_sec": {
+      "value": 1.517,
+      "target": 3.0,
+      "pass": true
+    }
+  }
+}

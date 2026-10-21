@@ -17,7 +17,7 @@
 ### 2. Local Checkpoints Verified (`~/.cache/huggingface/hub` on Both Nodes)
 | Model / Checkpoint ID | Local Snapshot Size | Quantization / Purpose | Present on Head (`spark-5a4e`) | Present on Worker (`spark-8a27`) |
 | :--- | :--- | :--- | :--- | :--- |
-| `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark` (`nvidia/GLM-5.3-Flash-FP4-Local` layout) | `175 GiB` | `modelopt_mixed` (NVFP4 routed experts group_size=16, BF16 dense/MLA/routers) | Yes | Yes |
+| `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark` (community ModelOpt PTQ, `calib_method: max` — **not** the NVIDIA QAD checkpoint; see PLAN.md D2) | `175 GiB` | `modelopt_mixed` (NVFP4 routed experts group_size=16, **MXFP8** attention (402) + shared experts (129) — corrected 2026-10-20) | Yes | Yes |
 | `incoai/GLM-5.3-Flash-DFlash2` | `4.4 GiB` | DFlash2 speculative drafter (`K=7`) | Yes | Yes |
 | `Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold` | `164 GiB` | Community EXL3 4bpw baseline | Yes | Yes |
 | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` | `171 GiB` | Community EXL3 vLLM baseline | Yes | Yes |

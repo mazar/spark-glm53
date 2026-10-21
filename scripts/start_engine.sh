@@ -194,6 +194,7 @@ COMMON_DOCKER_ENV=(
   -e "SPARK_DFLASH_STEPS=${SPARK_DFLASH_STEPS:-7}"
   -e "SPARK_COPY_DRAFT_SPAN=${SPARK_COPY_DRAFT_SPAN:-7}"
   -e "SPARK_PROFILE_STEPS=${SPARK_PROFILE_STEPS:-0}"
+  -e "SPARK_LAYER_PROF=${SPARK_LAYER_PROF:-0}"
   -e "PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.17"
 )
 
@@ -214,7 +215,7 @@ COMPILATION_JSON='{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_
 
 COMMON_VLLM_ARGS=(
   "$TARGET_SNAPSHOT"
-  --served-model-name GLM-5.3-Flash local-inference-lab/GLM-5.3-Flash-NVFP4-Spark nvidia/GLM-5.3-Flash-FP4-Local
+  --served-model-name GLM-5.3-Flash local-inference-lab/GLM-5.3-Flash-NVFP4-Spark
   --chat-template "$ROOT_DIR/worker/glm53_chat_template.jinja"
   --trust-remote-code
   --language-model-only
