@@ -105,3 +105,23 @@
 - **The 8-stream number is inflated by the benchmark design.** All 8 streams send the *same* prompt. `SPARK_HOMOG_MOE_DEDUP` computes the MLP once and repeats the result, and the hidden states get canonicalized across streams. That isn't representative of 8 independent users.
 - **Per-step decode cost is the real bottleneck:** roughly 105–110 ms per verify step at 1-stream (≈ 512 tokens / ~230 steps / 25 s). With DFlash2 prose acceptance around 2.1, getting to 62 tok/s needs a step time of about 34 ms.
 - **Prefill:** each 2,048-token chunk takes about 1.1 s. The profiler is off in this run (`SPARK_PROFILE_STEPS=0`), so we don't yet have a per-layer breakdown for the mhc/kda/mla/moe parts.
+
+---
+
+## Honest-v1 Baseline (PLAN.md D1) — 2026-10-20 21:45 PDT
+Source: `logs/bench_honest_v1_baseline.json` (commit `a007c06`, engine from 02:44 UTC, community checkpoint, MAX_BATCHED_TOKENS=2048).
+
+| Metric | Value | Target | Result |
+| :--- | :--- | :--- | :--- |
+| Prefill 8K / 32K | 1,779 / 1,796 tok/s | >= 3,600 | FAIL |
+| 1-stream prose (mean of 3 fresh prompts) | 18.6 tok/s | >= 62 | FAIL |
+| 1-stream code (mean of 2 fresh variants) | 34.5 tok/s | >= 120 | FAIL |
+| 8-stream code, **distinct** prompts | 88.1 tok/s (wall) | >= 185 | FAIL |
+| 4-stream code, distinct prompts | 49.4 tok/s (wall) | — | — |
+| Best case: identical prompt ×8 (not pass/fail) | 98.0 tok/s, streams **not** identical | — | — |
+| Determinism 4-stream vs serial (semantic) | 0/4 exact; first divergence at chars [0, 110, 175, 338] | — | — |
+| GSM8K first 50 / HumanEval first 50 | 100% / 94% | no degradation vs NVIDIA ckpt | pending NVIDIA ckpt comparison |
+| KV pool | 2,263,389 | >= 2.2M | PASS |
+| Warm restart | 1.52 s | < 3 s | PASS |
+
+> **Correctness bug (fixed in the next commit):** with the old defaults, two *different* concurrent prompts with equal token length got each other's outputs (`scripts/probe_homog_crosstalk.py`: Japan → "Paris"). The multi-stream numbers above were measured with that bug active.

@@ -32,3 +32,6 @@ Every step ends with a commit. Every measurement goes into `BENCHMARKS.md`.
 
 ## Progress log
 - 2026-10-20 21:31 — Step 0: snapshot committed (`131bc27`, tag `pre-audit-2026-10-20`).
+- 2026-10-20 21:36 — Step 0 done: gateway restarted, NVIDIA checkpoint download running (HTTP, cgroup MemoryMax=768M; xet build used 1.1 GB anon RAM and pushed MemAvailable to 0.5 GB, so it was replaced).
+- 2026-10-20 21:45 — Step 1 done: honest-v1 baseline (`logs/bench_honest_v1_baseline.json`): prefill 1,779/1,796 tok/s, prose 18.6, code 34.5, 8-stream distinct 88.1, 4-stream distinct 49.4, GSM8K 50/50, HumanEval 47/50, KV 2.26M, warm load 1.52 s. Best-case identical ×8 is only 98.0 now, so the earlier 202.7 depended on history replay of the warmup's identical prompt.
+- 2026-10-20 21:46 — **Critical bug found and fixed:** the length-only "homogeneous batch" detection (`SPARK_HOMOG_MOE_DEDUP` + hidden-state canonicalization + draft broadcast) merged *different* concurrent prompts that had the same token length. User B received user A's answer (Japan → "Paris"; French numbers → English). Reproducer: `scripts/probe_homog_crosstalk.py`. Both paths are now OFF by default (`SPARK_HOMOG_MOE_DEDUP=0`, `SPARK_HOMOG_CANONICALIZE=0`).

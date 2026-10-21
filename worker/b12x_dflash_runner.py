@@ -1293,7 +1293,10 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                     all_match
                     and first_ns is not None
                     and n_toks == len(sched_map) * first_ns
-                    and os.getenv("SPARK_HOMOG_MOE_DEDUP", "1") == "1"
+                    # OFF by default: detection compares lengths only, not token
+                    # contents, so distinct same-length prompts were merged and
+                    # received each other's outputs (scripts/probe_homog_crosstalk.py).
+                    and os.getenv("SPARK_HOMOG_MOE_DEDUP", "0") == "1"
                 ):
                     is_homog_exec = True
                     num_homog_reqs = len(sched_map)
@@ -1419,7 +1422,13 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                 except Exception:
                     skip_decode_bc = False
             is_homog = False
-            if num_reqs > 1 and num_tokens > 0 and num_tokens % num_reqs == 0:
+            # OFF by default (see SPARK_HOMOG_MOE_DEDUP note): hidden-state
+            # canonicalization + draft broadcast assume identical prompts but the
+            # check below only compares lengths -> cross-request output leakage.
+            if (
+                os.getenv("SPARK_HOMOG_CANONICALIZE", "0") == "1"
+                and num_reqs > 1 and num_tokens > 0 and num_tokens % num_reqs == 0
+            ):
                 try:
                     q_len = num_tokens // num_reqs
                     sched_np = ib.num_scheduled_tokens[:num_reqs]

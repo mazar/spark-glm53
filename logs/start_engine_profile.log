@@ -1,0 +1,59 @@
+[stop.sh] Cleaning Worker node (spark-8a27)...
+[stop.sh:worker] Stopping inference containers and stale worker processes...
+[stop.sh:worker] Stopping and removing container: spark-glm53-worker
+-rw-rw-rw- 1 root root  86G Oct 20 11:32 /dev/shm/glm53_rank_1.safetensors
+-rw-rw-rw- 1 root root 586K Oct 20 11:32 /dev/shm/glm53_rank_1.safetensors.cudaipc.json
+-rw-rw-rw- 1 root root    2 Oct 20 10:44 /dev/shm/glm53_rank_1.safetensors.w13_normalized
+[stop.sh] Cleaning Head node (spark-5a4e)...
+[stop.sh:head] Stopping inference containers and stale worker processes...
+[stop.sh:head] Stopping and removing container: spark-glm53-head
+-rw-rw-rw- 1 root root  86G Oct 20 11:32 /dev/shm/glm53_rank_0.safetensors
+-rw-rw-rw- 1 root root 586K Oct 20 11:32 /dev/shm/glm53_rank_0.safetensors.cudaipc.json
+-rw-rw-rw- 1 root root    2 Oct 20 10:44 /dev/shm/glm53_rank_0.safetensors.w13_normalized
+[stop.sh] Cluster stop complete.
+[start_engine] Reclaiming headless GPU contexts, locking GPU clocks (3003 MHz), disabling host swap, and flushing file page cache...
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[start_engine] Syncing worker codebase, chat template, and b12x compile cache to spark-8a27...
+[start_engine] Verifying persistent weight daemons on Head and Worker (SPARK_USE_CUDA_IPC=1)...
+[start_engine] Head UNLOCK /dev/shm/glm53_dflash2.safetensors -> {"ok":true}
+[start_engine] Head UNLOCK /dev/shm/glm53_rank_0.safetensors -> {"ok":true}
+[start_engine] Worker UNLOCK /dev/shm/glm53_dflash2.safetensors -> {"ok":true}
+[start_engine] Worker UNLOCK /dev/shm/glm53_rank_1.safetensors -> {"ok":true}
+{"rank":0,"pid":1,"socket_path":"/tmp/spark_shm_weights_rank_0.sock","total_bytes":0,"total_locked_bytes":0,"segments":{}}
+{"rank":1,"pid":1,"socket_path":"/tmp/spark_shm_weights_rank_1.sock","total_bytes":0,"total_locked_bytes":0,"segments":{}}
+[start_engine] Waiting for Head (Rank 0) spark-cuda-ipc-weights readiness...
+{"ok": true, "pid": 1, "rank": 0, "slabs": 23, "total_cuda_gib": 85.279, "ipc_json_path": "/dev/shm/glm53_rank_0.safetensors.cudaipc.json"}
+[start_engine] Waiting for Worker (Rank 1) spark-cuda-ipc-weights readiness...
+{"ok": true, "pid": 1, "rank": 1, "slabs": 23, "total_cuda_gib": 85.279, "ipc_json_path": "/dev/shm/glm53_rank_1.safetensors.cudaipc.json"}
+[start_engine] Starting Worker Rank 1 container (spark-glm53-worker) on spark-8a27...
+[start_engine] Starting Head Rank 0 container (spark-glm53-head) on spark-5a4e port 8000...
+[start_engine] Waiting for Spark-GLM53 engine on http://127.0.0.1:8000/health ...
