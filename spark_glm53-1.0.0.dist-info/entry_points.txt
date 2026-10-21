@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+spark_glm53 = worker.b12x_dflash_runner:install_all_spark_glm53_patches

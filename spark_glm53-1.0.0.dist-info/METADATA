@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: spark-glm53
+Version: 1.0.0
+Summary: Spark-GLM53 Phase 2 & Phase 3 vLLM general plugin for 2x DGX Spark (sm_121a)

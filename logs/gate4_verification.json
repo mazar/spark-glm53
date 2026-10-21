@@ -1,0 +1,80 @@
+{
+  "timestamp": "2026-10-20T16:15:46-0700",
+  "gateway_url": "http://127.0.0.1:8888",
+  "endpoints_check": {
+    "health_ok": true,
+    "models_count": 3,
+    "tokenize_ok": true
+  },
+  "dual_api_compatibility": {
+    "openai_responses_ok": true,
+    "anthropic_messages_ok": true,
+    "anthropic_stream_events": [
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+      "content_block_stop",
+      "message_delta",
+      "message_stop"
+    ],
+    "anthropic_stream_ok": true
+  },
+  "reasoning_and_clear_thinking": {
+    "low": {
+      "has_288": true,
+      "content_preview": "288"
+    },
+    "medium": {
+      "has_288": true,
+      "content_preview": "288"
+    },
+    "high": {
+      "has_288": true,
+      "content_preview": "288"
+    }
+  },
+  "hermes_20_tool_gauntlet": {
+    "num_tools_registered": 20,
+    "tool_calls_count": 1,
+    "called_function": "cluster_roce_status",
+    "parsed_arguments": {
+      "hca_device": "rocep1s0f1",
+      "include_pfc_counters": true,
+      "node_hostname": "spark-8a27"
+    },
+    "streaming_tool_calls_detected": true,
+    "pass": true
+  },
+  "multi_turn_64k_reuse": {
+    "turn1_ttft_ms": 2356.1,
+    "turn1_answer": "SPARK-GATE4-RADIX-64K-OK-9942",
+    "turn2_ttft_ms": 579.36,
+    "turn2_answer": "SPARK-GATE4-RADIX-64K-OK-9942",
+    "turn2_radix_headers": {
+      "hit_blocks": 301,
+      "hit_tokens": 77056,
+      "spilled_hit_blocks": 0,
+      "total_blocks": 0
+    },
+    "turn3_ttft_ms": 13.08,
+    "turn3_radix_headers": {
+      "hit_blocks": 301,
+      "hit_tokens": 77056,
+      "spilled_hit_blocks": 0,
+      "total_blocks": 0
+    },
+    "best_reuse_ttft_ms": 13.08,
+    "canary_preserved": true,
+    "pass_sub_100ms": true,
+    "gateway_radix_stats": {
+      "block_hits_total": 911,
+      "block_size_tokens": 256,
+      "lookups_total": 10,
+      "nvme_spill_reads_total": 301,
+      "nvme_spill_writes_total": 301,
+      "pinned_blocks": 10,
+      "token_hits_total": 232772
+    }
+  },
+  "gate4_all_passed": true
+}
