@@ -395,10 +395,10 @@ for i in $(seq 1 360); do
       GATEWAY_PORT="${GATEWAY_PORT:-8888}"
       log "Starting Go Control Plane (spark-gateway) on port ${GATEWAY_PORT} -> http://127.0.0.1:${ENGINE_PORT} ..."
       pkill -9 -x spark-gateway 2>/dev/null || true
-      nohup "$ROOT_DIR/bin/spark-gateway" \
+      docker exec -d spark-glm53-head "$ROOT_DIR/bin/spark-gateway" \
         --listen ":${GATEWAY_PORT}" \
         --upstream "http://127.0.0.1:${ENGINE_PORT}" \
-        --spill-dir "/tmp/spark_kv_spill" > /tmp/spark_gateway.log 2>&1 &
+        --spill-dir "/tmp/spark_kv_spill"
       sleep 1
       if curl -sf "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null 2>&1; then
         log "Go Control Plane (spark-gateway) is READY on port ${GATEWAY_PORT}!"
