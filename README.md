@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Hardware](https://img.shields.io/badge/Hardware-2x_NVIDIA_DGX_Spark_(GB10_sm__121a)-76B900.svg)](#hardware--cluster-requirements)
-[![Model](https://img.shields.io/badge/Model-GLM--5.3--Flash_(320B_/_18B_Active)-purple.svg)](#overview)
+[![Model](https://img.shields.io/badge/Model-GLM--5.3--Flash_(320B_/_18B_Active)-purple.svg)](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4-Spark)
 
 **`Spark-GLM53`** is a distributed Tensor-Parallel (`TP=2`) inference engine and Go control plane for **`GLM-5.3-Flash`** (`Glm5NextForConditionalGeneration`, 320B total / 18B active parameters, NoPE-MLA + KDA linear attention + Manifold-Constrained Hyper-Connections) running on **2x NVIDIA DGX Spark (`sm_121a`, GB10 Grace Blackwell)** nodes connected via dual-rail ConnectX-7 RoCE v2.
 
@@ -16,9 +16,9 @@ It combines:
 
 ## Benchmark Comparison: `Spark-GLM53` (NVFP4) vs. MiaAI-Lab `GLM-5.3-Flash-EXL3`
 
-Evaluated head-to-head on the exact same 2x NVIDIA DGX Spark cluster using [`tool-eval-bench`](https://github.com/prettygood-software/llama-benchy) (`tool-eval-bench run --seed 42 --hardmode --base-url http://127.0.0.1:8888`, 88 scenarios across Categories A–P, `Reasoning Effort: Max`, `temperature: 0.0`):
+Evaluated head-to-head on the exact same 2x NVIDIA DGX Spark cluster against both MiaAI-Lab recipes ([`MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) and [`MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)) using [`tool-eval-bench`](https://github.com/SeraphimSerapis/tool-eval-bench) (`tool-eval-bench run --seed 42 --hardmode --base-url http://127.0.0.1:8888`, 88 scenarios across Categories A–P, `Reasoning Effort: Max`, `temperature: 0.0`):
 
-| Metric (88 Scenarios, Hardmode, Seed 42) | MiaAI-Lab `GLM-5.3-Flash-EXL3` | `Spark-GLM53` (NVFP4 + `B12X` + `DFlash2`) | Delta |
+| Metric (88 Scenarios, Hardmode, Seed 42) | MiaAI-Lab [`GLM-5.3-Flash-EXL3`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks) | `Spark-GLM53` (NVFP4 + `B12X` + `DFlash2`) | Delta |
 | :--- | :--- | :--- | :--- |
 | **Overall Score** | `94 / 100` (`165 / 176` pts) | **`95 / 100` (`168 / 176` pts)** | **+1% (+3 pts)** |
 | **Structured Output (Category O)** | `83%` (`10 / 12` pts) | **`100%` (`12 / 12` pts)** | **+17% (+2 pts)** |
@@ -32,8 +32,8 @@ Evaluated head-to-head on the exact same 2x NVIDIA DGX Spark cluster using [`too
 | **Multi-Turn 64K Context Reuse TTFT** | ~450 ms | **`57.8 – 61.3 ms`** | **~7.5x faster** |
 | **Worker Warm Restart Time (Weight Load)**| `120 – 360 s` | **`1.50 – 1.60 s`** (CUDA IPC) / **`0.87 s`** (`shm`) | **>100x faster** |
 
-### Multi-Stream Prefill & Decode Throughput (`llama-benchy`, Concurrency `1..8`, Prose Corpus)
-Measured head-to-head on the exact same 2x DGX Spark cluster via `llama-benchy --base-url http://127.0.0.1:8888/v1 --pp 512 --tg 256 --exact-tg --no-cache --concurrency 1 2 4 8`:
+### Multi-Stream Prefill & Decode Throughput ([`llama-benchy`](https://github.com/eugr/llama-benchy), Concurrency `1..8`, Prose Corpus)
+Measured head-to-head on the exact same 2x DGX Spark cluster against [`MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold) via [`llama-benchy`](https://github.com/eugr/llama-benchy) (`llama-benchy --base-url http://127.0.0.1:8888/v1 --pp 512 --tg 256 --exact-tg --no-cache --concurrency 1 2 4 8`):
 
 | Concurrency | `Spark-GLM53` Prefill (`pp512` / `pp2048`) | TensorFold EXL3 Prefill (`pp512`) | `Spark-GLM53` Decode Avg (`tg256` Total / Req) | `Spark-GLM53` Decode Peak (`tg256` Total / Req) | TensorFold EXL3 Decode Avg (`tg256` Total / Req) | TensorFold EXL3 Decode Peak (`tg256` Total / Req) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -91,10 +91,10 @@ Sampled at **1 Hz** across both DGX Spark nodes (`spark-5a4e` Head + `spark-8a27
 - **Nodes:** 2x NVIDIA DGX Spark (`sm_121a`, GB10 Grace Blackwell, 128 GB Unified LPDDR5X each)
 - **Interconnect:** ConnectX-7 QSFP direct-attached cable (or switch) exposing twin PCIe Gen5 x4 RoCE v2 interfaces (`enp1s0f1np1` + `enP2p1s0f1np1` / `rocep1s0f1,roceP2p1s0f1`)
 - **SSH:** Passwordless SSH configured from the Head node to the Worker node
-- **Container Image:** `eugr/spark-vllm-b12x:latest` (tagged locally as `vllm-node-b12x:latest`) on both nodes
+- **Container Image:** [`eugr/spark-vllm-b12x:latest`](https://github.com/eugr/spark-vllm-docker) (tagged locally as `vllm-node-b12x:latest`) on both nodes
 - **Model Checkpoints (in `~/.cache/huggingface/hub` on both nodes):**
-  - Target Model: `local-inference-lab/GLM-5.3-Flash-NVFP4-Spark` (or `nvidia/GLM-5.3-Flash-FP4-Local`)
-  - Speculative Drafter (`K=7`): `incoai/GLM-5.3-Flash-DFlash2`
+  - Target Model: [`local-inference-lab/GLM-5.3-Flash-NVFP4-Spark`](https://huggingface.co/local-inference-lab/GLM-5.3-Flash-NVFP4-Spark) (or `nvidia/GLM-5.3-Flash-FP4-Local`)
+  - Speculative Drafter (`K=7`): [`incoai/GLM-5.3-Flash-DFlash2`](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)
 
 ---
 
