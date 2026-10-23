@@ -468,22 +468,6 @@ type ReasoningConfig struct {
 var (
 	thinkTagRegex       = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
 	cachedJinjaTemplate string
-
-	claudeSettingsMu      sync.Mutex
-	claudeSettingsModTime time.Time
-	claudeSettingsPath    string
-	claudeAliasEfforts    = map[string]string{
-		"GLM-5.3-Flash":        "max",
-		"GLM-5.3-Flash-opus":   "max",
-		"GLM-5.3-Flash-sonnet": "medium",
-		"GLM-5.3-Flash-haiku":  "low",
-	}
-	claudeDefaultEffort = "max"
-	claudeKnownAliases  = []string{
-		"GLM-5.3-Flash",
-		"GLM-5.3-Flash-sonnet",
-		"GLM-5.3-Flash-haiku",
-	}
 )
 
 func init() {
@@ -503,180 +487,6 @@ func init() {
 			break
 		}
 	}
-	refreshClaudeSettings()
-}
-
-func normalizeEffortName(raw string) (effort string, enableThinking bool, valid bool) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "none", "off", "disable", "disabled":
-		return "low", false, true
-	case "low", "minimal":
-		return "low", true, true
-	case "medium", "med":
-		return "medium", true, true
-	case "high":
-		return "high", true, true
-	case "xhigh", "max", "maximum":
-		return "max", true, true
-	default:
-		return "", true, false
-	}
-}
-
-// refreshClaudeSettings hot-reloads ~/.claude/settings.json whenever its mtime changes
-// so adding/modifying aliases or effortLevel in ~/.claude/settings.json takes effect immediately without restarting.
-func refreshClaudeSettings() {
-	claudeSettingsMu.Lock()
-	defer claudeSettingsMu.Unlock()
-
-	var candidates []string
-	if envPath := os.Getenv("CLAUDE_SETTINGS_PATH"); envPath != "" {
-		candidates = append(candidates, envPath)
-	}
-	if home := os.Getenv("HOME"); home != "" {
-		candidates = append(candidates, filepath.Join(home, ".claude", "settings.json"))
-	}
-	if exe, err := os.Executable(); err == nil {
-		// e.g. /home/<user>/spark-glm53/bin/spark-gateway -> /home/<user>/.claude/settings.json
-		userHome := filepath.Dir(filepath.Dir(filepath.Dir(exe)))
-		candidates = append(candidates, filepath.Join(userHome, ".claude", "settings.json"))
-	}
-	candidates = append(candidates, "/root/.claude/settings.json")
-
-	var chosen string
-	var st os.FileInfo
-	for _, c := range candidates {
-		if c == "" {
-			continue
-		}
-		if info, err := os.Stat(c); err == nil && !info.IsDir() {
-			chosen = c
-			st = info
-			break
-		}
-	}
-	if chosen == "" {
-		return
-	}
-	if chosen == claudeSettingsPath && st.ModTime().Equal(claudeSettingsModTime) {
-		return
-	}
-
-	b, err := os.ReadFile(chosen)
-	if err != nil {
-		return
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal(b, &parsed); err != nil {
-		return
-	}
-
-	efforts := map[string]string{
-		"GLM-5.3-Flash":        "max",
-		"GLM-5.3-Flash-opus":   "max",
-		"GLM-5.3-Flash-sonnet": "medium",
-		"GLM-5.3-Flash-haiku":  "low",
-	}
-	aliasOrder := []string{"GLM-5.3-Flash"}
-	seenAlias := map[string]bool{"GLM-5.3-Flash": true}
-	addAlias := func(a string) {
-		a = strings.TrimSpace(a)
-		if a != "" && !seenAlias[a] {
-			seenAlias[a] = true
-			aliasOrder = append(aliasOrder, a)
-		}
-	}
-
-	if defEff, ok := parsed["effortLevel"].(string); ok {
-		if norm, _, valid := normalizeEffortName(defEff); valid {
-			claudeDefaultEffort = norm
-		}
-	}
-	if envMap, ok := parsed["env"].(map[string]any); ok {
-		for _, k := range []string{
-			"ANTHROPIC_DEFAULT_FABLE_MODEL",
-			"ANTHROPIC_DEFAULT_OPUS_MODEL",
-			"ANTHROPIC_DEFAULT_SONNET_MODEL",
-			"ANTHROPIC_DEFAULT_HAIKU_MODEL",
-		} {
-			if v, ok := envMap[k].(string); ok && v != "" {
-				addAlias(v)
-			}
-		}
-	}
-	if msMap, ok := parsed["modelSettings"].(map[string]any); ok {
-		for alias, rawCfg := range msMap {
-			addAlias(alias)
-			if cfgMap, ok := rawCfg.(map[string]any); ok {
-				if effStr, ok := cfgMap["effortLevel"].(string); ok {
-					if norm, _, valid := normalizeEffortName(effStr); valid {
-						efforts[alias] = norm
-					}
-				}
-			}
-		}
-	}
-	if envAliases := os.Getenv("SPARK_MODEL_ALIASES"); envAliases != "" {
-		for _, part := range strings.Split(envAliases, ",") {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			if idx := strings.IndexByte(part, ':'); idx > 0 {
-				a := strings.TrimSpace(part[:idx])
-				e := strings.TrimSpace(part[idx+1:])
-				addAlias(a)
-				if norm, _, valid := normalizeEffortName(e); valid {
-					efforts[a] = norm
-				}
-			} else {
-				addAlias(part)
-			}
-		}
-	}
-
-	claudeAliasEfforts = efforts
-	claudeKnownAliases = aliasOrder
-	claudeSettingsPath = chosen
-	claudeSettingsModTime = st.ModTime()
-}
-
-func resolveModelAliasEffort(modelName string) (effort string, found bool) {
-	refreshClaudeSettings()
-	claudeSettingsMu.Lock()
-	defer claudeSettingsMu.Unlock()
-
-	modelName = strings.TrimSpace(modelName)
-	if modelName == "" {
-		return claudeDefaultEffort, false
-	}
-	if eff, ok := claudeAliasEfforts[modelName]; ok {
-		return eff, true
-	}
-	for k, eff := range claudeAliasEfforts {
-		if strings.EqualFold(k, modelName) {
-			return eff, true
-		}
-	}
-	lower := strings.ToLower(modelName)
-	switch {
-	case strings.Contains(lower, "haiku"):
-		return "low", true
-	case strings.Contains(lower, "sonnet"):
-		return "medium", true
-	case strings.Contains(lower, "opus") || strings.Contains(lower, "fable"):
-		return "max", true
-	}
-	return claudeDefaultEffort, false
-}
-
-func getConfiguredModelAliases() []string {
-	refreshClaudeSettings()
-	claudeSettingsMu.Lock()
-	defer claudeSettingsMu.Unlock()
-	out := make([]string, len(claudeKnownAliases))
-	copy(out, claudeKnownAliases)
-	return out
 }
 
 func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
@@ -694,7 +504,7 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		ctk = make(map[string]any)
 	}
 
-	// Extract reasoning_effort from top-level, reasoning.effort, output_config.effort, chat_template_kwargs, or model alias
+	// Extract reasoning_effort from top-level, reasoning.effort, or chat_template_kwargs
 	var rawEffort string
 	if v, ok := reqMap["reasoning_effort"].(string); ok && v != "" {
 		rawEffort = strings.ToLower(strings.TrimSpace(v))
@@ -702,21 +512,11 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		if v, ok := rObj["effort"].(string); ok && v != "" {
 			rawEffort = strings.ToLower(strings.TrimSpace(v))
 		}
-	} else if ocObj, ok := reqMap["output_config"].(map[string]any); ok {
-		if v, ok := ocObj["effort"].(string); ok && v != "" {
-			rawEffort = strings.ToLower(strings.TrimSpace(v))
-		}
 	} else if v, ok := ctk["reasoning_effort"].(string); ok && v != "" {
 		rawEffort = strings.ToLower(strings.TrimSpace(v))
-	} else if reqModel, ok := reqMap["_requested_model"].(string); ok && reqModel != "" {
-		if aliasEff, found := resolveModelAliasEffort(reqModel); found {
-			rawEffort = aliasEff
-		}
 	}
 	delete(reqMap, "reasoning_effort")
 	delete(reqMap, "reasoning")
-	delete(reqMap, "output_config")
-	delete(reqMap, "_requested_model")
 
 	if v, ok := ctk["enable_thinking"].(bool); ok {
 		cfg.EnableThinking = v
@@ -732,11 +532,11 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		cfg.EnableThinking = false
 		cfg.SoftTokenCap = 0
 		cfg.HardTokenCap = 0
-	case "low", "minimal":
+	case "low":
 		cfg.Effort = "low"
 		cfg.SoftTokenCap = 192
 		cfg.HardTokenCap = 32768
-	case "medium", "med":
+	case "medium":
 		cfg.Effort = "medium"
 		cfg.SoftTokenCap = 768
 		cfg.HardTokenCap = 32768
@@ -744,7 +544,7 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		cfg.Effort = "high"
 		cfg.SoftTokenCap = 3072
 		cfg.HardTokenCap = 32768
-	case "xhigh", "max", "maximum", "":
+	case "max", "":
 		cfg.Effort = "max"
 		cfg.SoftTokenCap = 32768
 		cfg.HardTokenCap = 32768
@@ -1337,10 +1137,7 @@ func (gs *GatewayServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Capture requested model alias (e.g. GLM-5.3-Flash-sonnet, GLM-5.3-Flash-haiku) before normalizing
-	if reqModel, ok := reqMap["model"].(string); ok && reqModel != "" {
-		reqMap["_requested_model"] = reqModel
-	}
+	// Normalize model alias to primary served model name
 	reqMap["model"] = "GLM-5.3-Flash"
 
 	reasoningCfg := NormalizeReasoningAndMessages(reqMap)
@@ -2083,7 +1880,7 @@ func (f *FakeResponseWriter) Write(b []byte) (int, error) { return f.buf.Write(b
 func (f *FakeResponseWriter) WriteHeader(statusCode int)  { f.status = statusCode }
 
 // ============================================================================
-// 6. Anthropic `/v1/messages` & `/v1/messages/count_tokens` Compatibility Endpoint
+// 6. Anthropic `/v1/messages` Compatibility Endpoint
 // ============================================================================
 
 func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -2092,8 +1889,6 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		return
 	}
 	gs.totalRequests.Add(1)
-
-	isCountTokens := strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/count_tokens")
 
 	bodyBytes, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -2108,17 +1903,11 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		return
 	}
 
-	requestedModel, _ := anthReq["model"].(string)
-	if requestedModel == "" {
-		requestedModel = "GLM-5.3-Flash"
-	}
-
 	var oaMsgs []map[string]any
 	if sysPrompt := extractTextContent(anthReq["system"]); sysPrompt != "" {
 		oaMsgs = append(oaMsgs, map[string]any{"role": "system", "content": sysPrompt})
 	}
 
-	hasHistoricalThinking := false
 	if rawMsgs, ok := anthReq["messages"].([]any); ok {
 		for _, rm := range rawMsgs {
 			m, ok := rm.(map[string]any)
@@ -2133,7 +1922,7 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 				var textParts []string
 				var toolCalls []any
 				var toolResults []map[string]any
-				var thinkingParts []string
+				var thinkingText string
 				for _, blkRaw := range content {
 					blk, ok := blkRaw.(map[string]any)
 					if !ok {
@@ -2146,16 +1935,11 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 							textParts = append(textParts, t)
 						}
 					case "thinking":
-						if t, ok := blk["thinking"].(string); ok && t != "" {
-							thinkingParts = append(thinkingParts, t)
-							hasHistoricalThinking = true
+						if t, ok := blk["thinking"].(string); ok {
+							thinkingText = t
 						}
 					case "tool_use":
-						inputObj := blk["input"]
-						if inputObj == nil {
-							inputObj = map[string]any{}
-						}
-						inputBytes, _ := json.Marshal(inputObj)
+						inputBytes, _ := json.Marshal(blk["input"])
 						toolCalls = append(toolCalls, map[string]any{
 							"id":   blk["id"],
 							"type": "function",
@@ -2165,31 +1949,20 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 							},
 						})
 					case "tool_result":
-						resText := extractTextContent(blk["content"])
-						if isErr, _ := blk["is_error"].(bool); isErr && resText != "" {
-							resText = "Tool error: " + resText
-						}
 						toolResults = append(toolResults, map[string]any{
 							"role":         "tool",
 							"tool_call_id": blk["tool_use_id"],
-							"content":      resText,
+							"content":      extractTextContent(blk["content"]),
 						})
 					}
 				}
-				// Tool results in a user turn MUST precede any trailing user text in that turn
-				if role == "user" && len(toolResults) > 0 {
-					for _, tr := range toolResults {
-						oaMsgs = append(oaMsgs, tr)
-					}
-					toolResults = nil
-				}
-				if len(textParts) > 0 || len(toolCalls) > 0 || len(thinkingParts) > 0 {
+				if len(textParts) > 0 || len(toolCalls) > 0 || thinkingText != "" {
 					msgObj := map[string]any{
 						"role":    role,
 						"content": strings.Join(textParts, "\n"),
 					}
-					if len(thinkingParts) > 0 {
-						msgObj["reasoning_content"] = strings.Join(thinkingParts, "")
+					if thinkingText != "" {
+						msgObj["reasoning_content"] = thinkingText
 					}
 					if len(toolCalls) > 0 {
 						msgObj["tool_calls"] = toolCalls
@@ -2219,100 +1992,20 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		}
 	}
 
-	// Resolve thinking & effort level from:
-	//   1) Explicit request fields: output_config.effort, reasoning_effort, effort
-	//   2) thinking: {type: "enabled" | "adaptive" | "disabled", budget_tokens: ...}
-	//   3) Hot-reloaded ~/.claude/settings.json modelSettings[requestedModel].effortLevel (or suffix -haiku/-sonnet/-opus)
-	aliasEffort, _ := resolveModelAliasEffort(requestedModel)
-	enableThinking := true
-	reasoningEffort := aliasEffort
-	if reasoningEffort == "" {
-		reasoningEffort = "max"
-	}
-
-	explicitEffortSet := false
-	if oc, ok := anthReq["output_config"].(map[string]any); ok {
-		if effStr, ok := oc["effort"].(string); ok && effStr != "" {
-			if norm, en, valid := normalizeEffortName(effStr); valid {
-				reasoningEffort = norm
-				enableThinking = en
-				explicitEffortSet = true
-			}
-		}
-	}
-	for _, k := range []string{"reasoning_effort", "effort"} {
-		if effStr, ok := anthReq[k].(string); ok && effStr != "" {
-			if norm, en, valid := normalizeEffortName(effStr); valid {
-				reasoningEffort = norm
-				enableThinking = en
-				explicitEffortSet = true
-			}
-		}
-	}
-
+	enableThinking := false
+	reasoningEffort := "low"
 	if th, ok := anthReq["thinking"].(map[string]any); ok {
-		tType, _ := th["type"].(string)
-		switch strings.ToLower(strings.TrimSpace(tType)) {
-		case "disabled", "off", "none":
-			enableThinking = false
-			reasoningEffort = "low"
-		case "enabled", "adaptive":
+		if tType, _ := th["type"].(string); tType == "enabled" {
 			enableThinking = true
-			if !explicitEffortSet {
-				if budget, ok := th["budget_tokens"].(float64); ok && budget > 0 {
-					switch {
-					case budget <= 1024:
-						reasoningEffort = "low"
-					case budget <= 4096:
-						reasoningEffort = "medium"
-					case budget <= 16384:
-						reasoningEffort = "high"
-					default:
-						reasoningEffort = "max"
-					}
-				}
+			budget, _ := th["budget_tokens"].(float64)
+			switch {
+			case budget <= 512:
+				reasoningEffort = "low"
+			case budget <= 2048:
+				reasoningEffort = "medium"
+			default:
+				reasoningEffort = "high"
 			}
-		}
-	}
-
-	if isCountTokens {
-		tokReq := map[string]any{
-			"model":    "GLM-5.3-Flash",
-			"messages": oaMsgs,
-		}
-		if len(oaTools) > 0 {
-			tokReq["tools"] = oaTools
-		}
-		tokBytes, _ := json.Marshal(tokReq)
-		upTokReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, gs.upstreamURL+"/tokenize", bytes.NewReader(tokBytes))
-		if err == nil {
-			upTokReq.Header.Set("Content-Type", "application/json")
-			if tokResp, err := gs.client.Do(upTokReq); err == nil {
-				defer tokResp.Body.Close()
-				var tokParsed map[string]any
-				if err := json.NewDecoder(tokResp.Body).Decode(&tokParsed); err == nil {
-					if cnt, ok := tokParsed["count"].(float64); ok && cnt > 0 {
-						w.Header().Set("Content-Type", "application/json")
-						_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": int(cnt)})
-						return
-					}
-				}
-			}
-		}
-		// Fallback estimate if /tokenize returns an error
-		est := len(bodyBytes) / 4
-		if est < 1 {
-			est = 1
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": est})
-		return
-	}
-
-	clearThinking := !hasHistoricalThinking
-	if ctMap, ok := anthReq["context_management"].(map[string]any); ok {
-		if edits, ok := ctMap["edits"].([]any); ok && len(edits) > 0 {
-			clearThinking = false
 		}
 	}
 
@@ -2325,55 +2018,20 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		"chat_template_kwargs": map[string]any{
 			"enable_thinking":  enableThinking,
 			"reasoning_effort": reasoningEffort,
-			"clear_thinking":   clearThinking,
+			"clear_thinking":   true,
 		},
 	}
-	if !enableThinking {
-		delete(oaReq["chat_template_kwargs"].(map[string]any), "reasoning_effort")
-	}
 	if oaReq["max_tokens"] == nil {
-		oaReq["max_tokens"] = 16384
-	}
-	if stops, ok := anthReq["stop_sequences"].([]any); ok && len(stops) > 0 {
-		oaReq["stop"] = stops
+		oaReq["max_tokens"] = 1024
 	}
 	if len(oaTools) > 0 {
-		oaReq["tools"] = oaTools
+		oaReq["chat_template_kwargs"].(map[string]any)["tools"] = oaTools
 	}
-	if tc, ok := anthReq["tool_choice"].(map[string]any); ok {
-		tcType, _ := tc["type"].(string)
-		switch tcType {
-		case "auto", "none":
-			oaReq["tool_choice"] = tcType
-		case "any":
-			oaReq["tool_choice"] = "required"
-		case "tool":
-			if nameStr, ok := tc["name"].(string); ok && nameStr != "" {
-				oaReq["tool_choice"] = map[string]any{
-					"type":     "function",
-					"function": map[string]any{"name": nameStr},
-				}
-			}
-		}
-	}
-
-	reasoningCfg := NormalizeReasoningAndMessages(oaReq)
-	w.Header().Set("X-Spark-Reasoning-Effort", reasoningCfg.Effort)
-	w.Header().Set("X-Spark-Model-Alias", requestedModel)
 
 	hitBlocks, hitTokens, nvmeRestored := gs.router.RouteAndPin(oaMsgs, oaTools)
 	w.Header().Set("X-Spark-Prefix-Cache-Hit-Blocks", strconv.Itoa(hitBlocks))
 	w.Header().Set("X-Spark-Prefix-Cache-Hit-Tokens", strconv.Itoa(hitTokens))
 	w.Header().Set("X-Spark-NVMe-Spill-Restored", strconv.Itoa(nvmeRestored))
-
-	// Move top-level tools into chat_template_kwargs["tools"] as in handleChatCompletions
-	if len(oaTools) > 0 && reasoningCfg.ToolChoice != "none" {
-		if ctk, ok := oaReq["chat_template_kwargs"].(map[string]any); ok {
-			ctk["tools"] = oaTools
-		}
-	}
-	delete(oaReq, "tools")
-	delete(oaReq, "tool_choice")
 
 	oaBytes, _ := json.Marshal(oaReq)
 	upReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gs.upstreamURL+"/v1/chat/completions", bytes.NewReader(oaBytes))
@@ -2387,7 +2045,12 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 
 	var rec FakeResponseWriter
 	rec.header = make(http.Header)
-	gs.handleNonStreamingChatResponse(&rec, resp.Body, reasoningCfg, "")
+	gs.handleNonStreamingChatResponse(&rec, resp.Body, ReasoningConfig{
+		Effort:         reasoningEffort,
+		EnableThinking: enableThinking,
+		ClearThinking:  true,
+		HardTokenCap:   4096,
+	}, "")
 
 	var oaResp map[string]any
 	_ = json.Unmarshal(rec.buf.Bytes(), &oaResp)
@@ -2396,20 +2059,11 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 	stopReason := "end_turn"
 	if choices, ok := oaResp["choices"].([]any); ok && len(choices) > 0 {
 		if ch, ok := choices[0].(map[string]any); ok {
-			if fr, ok := ch["finish_reason"].(string); ok {
-				switch fr {
-				case "tool_calls":
-					stopReason = "tool_use"
-				case "length":
-					stopReason = "max_tokens"
-				}
-			}
 			if msg, ok := ch["message"].(map[string]any); ok {
 				if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
 					contentBlocks = append(contentBlocks, map[string]any{
-						"type":      "thinking",
-						"thinking":  rc,
-						"signature": "",
+						"type":     "thinking",
+						"thinking": rc,
 					})
 				}
 				if c, ok := msg["content"].(string); ok && c != "" {
@@ -2446,36 +2100,19 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 	usageMap, _ := oaResp["usage"].(map[string]any)
 	inToks, _ := usageMap["prompt_tokens"].(float64)
 	outToks, _ := usageMap["completion_tokens"].(float64)
-	cachedToks := 0
-	if ptd, ok := usageMap["prompt_tokens_details"].(map[string]any); ok {
-		if ct, ok := ptd["cached_tokens"].(float64); ok && ct > 0 {
-			cachedToks = int(ct)
-		}
-	}
-	if cachedToks == 0 && hitTokens > 0 && hitTokens <= int(inToks) {
-		cachedToks = hitTokens
-	}
-	uncachedInToks := int(inToks) - cachedToks
-	if uncachedInToks < 0 {
-		uncachedInToks = 0
-	}
-
-	anthUsage := map[string]any{
-		"input_tokens":                uncachedInToks,
-		"output_tokens":               int(outToks),
-		"cache_creation_input_tokens": 0,
-		"cache_read_input_tokens":     cachedToks,
-	}
 
 	anthMsg := map[string]any{
 		"id":            "msg_" + strconv.FormatInt(time.Now().UnixNano(), 10),
 		"type":          "message",
 		"role":          "assistant",
-		"model":         requestedModel,
+		"model":         anthReq["model"],
 		"content":       contentBlocks,
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
-		"usage":         anthUsage,
+		"usage": map[string]any{
+			"input_tokens":  int(inToks),
+			"output_tokens": int(outToks),
+		},
 	}
 
 	isStream, _ := anthReq["stream"].(bool)
@@ -2485,7 +2122,7 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Emit Anthropic SSE event stream (including signature_delta for thinking blocks)
+	// Emit Anthropic SSE event stream
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
@@ -2500,19 +2137,12 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 	sendEvent("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":            anthMsg["id"],
-			"type":          "message",
-			"role":          "assistant",
-			"model":         requestedModel,
-			"content":       []any{},
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"usage": map[string]any{
-				"input_tokens":                uncachedInToks,
-				"output_tokens":               0,
-				"cache_creation_input_tokens": 0,
-				"cache_read_input_tokens":     cachedToks,
-			},
+			"id":      anthMsg["id"],
+			"type":    "message",
+			"role":    "assistant",
+			"model":   anthReq["model"],
+			"content": []any{},
+			"usage":   map[string]any{"input_tokens": int(inToks), "output_tokens": 0},
 		},
 	})
 	for idx, blk := range contentBlocks {
@@ -2540,11 +2170,6 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 				"index": idx,
 				"delta": map[string]any{"type": "thinking_delta", "thinking": blk["thinking"]},
 			})
-			sendEvent("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": idx,
-				"delta": map[string]any{"type": "signature_delta", "signature": ""},
-			})
 		case "tool_use":
 			inBytes, _ := json.Marshal(blk["input"])
 			sendEvent("content_block_start", map[string]any{
@@ -2568,7 +2193,7 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 	sendEvent("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
-		"usage": anthUsage,
+		"usage": map[string]any{"output_tokens": int(outToks)},
 	})
 	sendEvent("message_stop", map[string]any{"type": "message_stop"})
 }
@@ -2692,70 +2317,13 @@ func (gs *GatewayServer) handleModels(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(body)
 		return
 	}
-
-	cloneModelEntry := func(template map[string]any, alias string) map[string]any {
-		cp := make(map[string]any, len(template)+4)
-		for k, v := range template {
-			cp[k] = v
-		}
-		cp["id"] = alias
-		cp["display_name"] = alias
-		cp["type"] = "model"
-		cp["object"] = "model"
-		cp["root"] = "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark"
-		if eff, ok := resolveModelAliasEffort(alias); ok && eff != "" {
-			cp["default_effort"] = eff
-		}
-		return cp
-	}
-
-	var templateModel map[string]any
 	if dataList, ok := parsed["data"].([]any); ok && len(dataList) > 0 {
 		if firstModel, ok := dataList[0].(map[string]any); ok {
-			templateModel = firstModel
+			firstModel["id"] = "GLM-5.3-Flash"
+			firstModel["root"] = "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark"
+			parsed["data"] = []any{firstModel}
 		}
 	}
-	if templateModel == nil {
-		templateModel = map[string]any{
-			"id":         "GLM-5.3-Flash",
-			"object":     "model",
-			"type":       "model",
-			"created_at": "2026-10-16T00:00:00Z",
-			"owned_by":   "spark-glm53",
-		}
-	}
-
-	// Support single-model lookup: GET /v1/models/{model_id} or /models/{model_id}
-	trimmedPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/v1/models"), "/models")
-	trimmedPath = strings.TrimPrefix(trimmedPath, "/")
-	if trimmedPath != "" {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(cloneModelEntry(templateModel, trimmedPath))
-		return
-	}
-
-	// Advertise all configured Claude CLI aliases when queried with Anthropic headers or ?aliases=1
-	includeAliases := r.URL.Query().Get("aliases") == "1" ||
-		r.Header.Get("anthropic-version") != "" ||
-		r.Header.Get("x-api-key") != "" ||
-		os.Getenv("SPARK_ADVERTISE_ALIASES") == "1"
-
-	if includeAliases {
-		aliases := getConfiguredModelAliases()
-		outList := make([]any, 0, len(aliases))
-		for _, alias := range aliases {
-			outList = append(outList, cloneModelEntry(templateModel, alias))
-		}
-		parsed["data"] = outList
-		if len(aliases) > 0 {
-			parsed["first_id"] = aliases[0]
-			parsed["last_id"] = aliases[len(aliases)-1]
-			parsed["has_more"] = false
-		}
-	} else {
-		parsed["data"] = []any{cloneModelEntry(templateModel, "GLM-5.3-Flash")}
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(parsed)
 }
@@ -2774,20 +2342,12 @@ func main() {
 	router := NewRadixPrefixRouter(*blockSize, MaxRadixBlocks, *spillDir)
 	srv := NewGatewayServer(*upstreamURL, router)
 
-	aliases := getConfiguredModelAliases()
-	log.Printf("[spark-gateway] Loaded model aliases (%d): %v", len(aliases), aliases)
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", srv.handleChatCompletions)
 	mux.HandleFunc("/v1/responses", srv.handleResponsesAPI)
 	mux.HandleFunc("/v1/messages", srv.handleAnthropicMessages)
-	mux.HandleFunc("/v1/messages/", srv.handleAnthropicMessages)
-	mux.HandleFunc("/messages", srv.handleAnthropicMessages)
-	mux.HandleFunc("/messages/", srv.handleAnthropicMessages)
 	mux.HandleFunc("/v1/models", srv.handleModels)
-	mux.HandleFunc("/v1/models/", srv.handleModels)
 	mux.HandleFunc("/models", srv.handleModels)
-	mux.HandleFunc("/models/", srv.handleModels)
 	mux.HandleFunc("/tokenize", srv.handleProxyPass)
 	mux.HandleFunc("/detokenize", srv.handleProxyPass)
 	mux.HandleFunc("/health", srv.handleHealth)

@@ -178,36 +178,9 @@ To also tear down the persistent weight daemons and free `/dev/shm`:
 
 `spark-gateway` (`:8888`) natively respects per-request thinking and effort controls across all client formats while preserving multi-turn KV prefix-cache hits:
 - **Default (`Max`):** When omitted, defaults to `<|system|>Reasoning Effort: Max` (matching the native GLM-5.3 Jinja template).
-- **Per-Request Effort (`low`, `medium`, `high`, `max` / `xhigh`):** Pass top-level `"reasoning_effort": "low"`, `"reasoning": {"effort": "low"}`, `"output_config": {"effort": "medium"}`, or `"chat_template_kwargs": {"reasoning_effort": "low"}`.
-- **Disable Thinking (`none` / `enable_thinking: false`):** Pass `"reasoning_effort": "none"`, `"enable_thinking": false`, `"thinking": {"type": "disabled"}`, or `tool-eval-bench --no-think`. The template emits `<|assistant|><think></think>` so the model skips `<think>` and achieves **85%–98.6% `DFlash2` (`K=7`) draft acceptance** on code and structured JSON.
+- **Per-Request Effort (`low`, `medium`, `high`, `max`):** Pass top-level `"reasoning_effort": "low"`, `"reasoning": {"effort": "low"}`, or `"chat_template_kwargs": {"reasoning_effort": "low"}`.
+- **Disable Thinking (`none` / `enable_thinking: false`):** Pass `"reasoning_effort": "none"`, `"enable_thinking": false`, or `tool-eval-bench --no-think`. The template emits `<|assistant|><think></think>` so the model skips `<think>` and achieves **85%–98.6% `DFlash2` (`K=7`) draft acceptance** on code and structured JSON.
 - **Guided Decoding (`response_format`):** When `response_format` (`json_schema` / `json_object`) is active on a turn, `spark-gateway` automatically closes `<think></think>` at the end of the prompt while preserving `<|system|>Reasoning Effort: Max` at token 0 so multi-turn tool $\rightarrow$ JSON workflows get a 100% KV prefix-cache hit on prior turns and emit schema-valid JSON directly into `message.content`.
-
----
-
-## Claude Code CLI (`~/.claude/settings.json`) & Dynamic Model Aliases
-
-`spark-gateway` (`:8888`) automatically watches `~/.claude/settings.json` by file `ModTime` and **hot-reloads** model aliases and per-alias `effortLevel` settings on every request without restarting the engine or gateway:
-
-```json
-{
-  "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8888",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL": "GLM-5.3-Flash",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "GLM-5.3-Flash",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "GLM-5.3-Flash-sonnet",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "GLM-5.3-Flash-haiku"
-  },
-  "effortLevel": "xhigh",
-  "modelSettings": {
-    "GLM-5.3-Flash": { "effortLevel": "xhigh" },
-    "GLM-5.3-Flash-sonnet": { "effortLevel": "medium" },
-    "GLM-5.3-Flash-haiku": { "effortLevel": "low" }
-  }
-}
-```
-
-- **Zero-Downtime Config Reload:** Adding, renaming, or changing aliases or `effortLevel` (`low`, `medium`, `high`, `xhigh`/`max`, `none`) in `~/.claude/settings.json` takes effect immediately on the next request.
-- **Full Anthropic Messages API Surface:** Supports `/v1/messages`, `/v1/messages/count_tokens`, `GET /v1/models` (advertising all configured aliases when queried with `anthropic-version` or `x-api-key` headers), `GET /v1/models/{alias}`, `thinking.type` (`enabled`, `adaptive`, `disabled`), `output_config.effort`, `signature_delta`, `cache_read_input_tokens`, and echo-back of the requested model alias in `message_start` and non-streaming responses.
 
 ---
 
