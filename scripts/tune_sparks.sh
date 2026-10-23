@@ -296,7 +296,8 @@ import json, os
 g = 0.0
 if os.path.exists("/dev/shm/glm53_rank_0.safetensors.cudaipc.json"):
     with open("/dev/shm/glm53_rank_0.safetensors.cudaipc.json") as f:
-        g += float(json.load(f).get("total_cuda_gib", 0.0))
+        d = json.load(f)
+        g += float(d.get("total_cuda_bytes", 0)) / (1024**3)
 elif os.path.exists("/dev/shm/glm53_rank_0.safetensors"):
     st = os.stat("/dev/shm/glm53_rank_0.safetensors")
     g += (st.st_blocks * 512) / (1024**3)
@@ -311,7 +312,8 @@ import json, os
 g = 0.0
 if os.path.exists(\"/dev/shm/glm53_rank_1.safetensors.cudaipc.json\"):
     with open(\"/dev/shm/glm53_rank_1.safetensors.cudaipc.json\") as f:
-        g += float(json.load(f).get(\"total_cuda_gib\", 0.0))
+        d = json.load(f)
+        g += float(d.get(\"total_cuda_bytes\", 0)) / (1024**3)
 elif os.path.exists(\"/dev/shm/glm53_rank_1.safetensors\"):
     st = os.stat(\"/dev/shm/glm53_rank_1.safetensors\")
     g += (st.st_blocks * 512) / (1024**3)
