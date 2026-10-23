@@ -215,4 +215,23 @@ moe_routed ≈ 510 ms (45%), KDA ≈ 200 ms, MLA ≈ 135–170 ms, **mHC ≈ 125
 | **Median Turn Latency** | `4,811.0 ms` | **`4,343.5 ms`** | **-9.7% faster per turn** |
 | **Total Completion Tokens** | `58,704` | `56,977` | `-2.9%` (both `Reasoning Effort: Max`) |
 
+### 5. `llama-benchy` Multi-Stream Concurrency (`c1..c8`) & 1 Hz Dual-Node Power / Thermal Telemetry (2026-10-23)
+**Sources:** `/tmp/power_temp_llama_benchy.json`, `/tmp/power_temp_llama_benchy_dual.json` (`scripts/run_power_temp_bench.py`)
+
+#### A. `llama-benchy` Multi-Stream Throughput (`--exact-tg --no-cache`, Prose Corpus)
+| Concurrency | `pp512` Total `tok/s` | `pp2048` Total `tok/s` | `tg256` Avg Total `tok/s` | `tg256` Peak Total `tok/s` | `tg256` Per-Req `tok/s` | `pp512` E2E TTFT (`ms`) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`c = 1`** | `898.67 ± 2.78` | `1,768.63 ± 3.89` | `31.21 ± 2.73` | `49.67 ± 1.70` | `31.21 ± 2.73` | `572.99 ± 1.77` |
+| **`c = 2`** | `1,327.75 ± 16.62` | **`2,206.44 ± 5.23`** | `41.69 ± 1.84` | `76.00 ± 3.30` | `21.64 ± 1.51` | `771.10 ± 9.75` |
+| **`c = 4`** | `1,778.45 ± 2.49` | `2,033.66 ± 3.99` | `57.29 ± 2.64` | `116.00 ± 5.35` | `15.20 ± 1.03` | `1,151.13 ± 1.67` |
+| **`c = 8`** | **`2,237.61 ± 2.94`** | `2,041.40 ± 4.24` | **`91.32 ± 6.81`** | **`165.00 ± 7.48`** | `12.94 ± 1.45` | `1,829.61 ± 2.59` |
+
+#### B. 1 Hz Dual-Node Power (`W` / `Wh` / `J`) & Thermal (`°C`) Telemetry (`spark-5a4e` + `spark-8a27`)
+| Node / Metric | Idle GPU Power | Active Avg GPU Power | Peak GPU Power | Energy (`268.4s`, 3 Runs `c1..c8`) | GPU Temp (Start $\rightarrow$ Avg / Max) | Grace SoC Temp (Avg / Max) | Avg SM Clock / GPU Util |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Head Node (`spark-5a4e`, Rank 0)** | `16.37 – 16.82 W` | **`35.21 – 36.22 W`** | **`62.36 – 63.90 W`** | `2.7008 Wh` (`9,722.8 J`) | `45.0°C` $\rightarrow$ **`60.8°C` / `69.0°C`** | `76.9°C` / `84.9°C` | `2,535 MHz` (`94.9%`) |
+| **Worker Node (`spark-8a27`, Rank 1)** | `16.34 – 16.42 W` | **`35.37 W`** | **`62.72 W`** | `2.7127 Wh` (`9,765.8 J`) | `48.7°C` $\rightarrow$ **`58.5°C` / `64.0°C`** | `68.9°C` / `75.7°C` | `2,559 MHz` (`95.2%`) |
+| **2x DGX Spark Cluster Total (`TP=2`)** | **`33.16 W`** | **`70.53 – 72.44 W`** | **`102.67 – 126.62 W`** | **`5.4135 Wh` (`19,488.6 J`)** | Max **`69.0°C`** | Max **`84.9°C`** | **`~34.4 Wh`** (`123.7 kJ`) est. for full 29.2m `tool-eval-bench` |
+
+
 

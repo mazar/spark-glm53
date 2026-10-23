@@ -32,7 +32,24 @@ Evaluated head-to-head on the exact same 2x NVIDIA DGX Spark cluster using [`too
 | **Multi-Turn 64K Context Reuse TTFT** | ~450 ms | **`57.8 – 61.3 ms`** | **~7.5x faster** |
 | **Worker Warm Restart Time (Weight Load)**| `120 – 360 s` | **`1.50 – 1.60 s`** (CUDA IPC) / **`0.87 s`** (`shm`) | **>100x faster** |
 
-*(Dual-node power draw in Watts/Wh and thermal telemetry under matched DVFS clock policies will be added in an upcoming update).*
+### Multi-Stream Throughput (`llama-benchy`, Concurrency `1..8`, Prose Corpus)
+Measured via `llama-benchy --base-url http://127.0.0.1:8888/v1 --model GLM-5.3-Flash --pp 512 --tg 256 --exact-tg --no-cache --concurrency 1 2 4 8` (and `--pp 2048`):
+
+| Concurrency | Prefill (`pp512`) Total `tok/s` | Prefill (`pp2048`) Total `tok/s` | Decode (`tg256` Prose) Avg `tok/s` | Decode (`tg256` Prose) Peak `tok/s` | Per-Request Decode `tok/s` |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`c = 1`** | `898.67 ± 2.78` | `1,768.63 ± 3.89` | `31.21 ± 2.73` | `49.67 ± 1.70` | `31.21 ± 2.73` |
+| **`c = 2`** | `1,327.75 ± 16.62` | **`2,206.44 ± 5.23`** | `41.69 ± 1.84` | `76.00 ± 3.30` | `21.64 ± 1.51` |
+| **`c = 4`** | `1,778.45 ± 2.49` | `2,033.66 ± 3.99` | `57.29 ± 2.64` | `116.00 ± 5.35` | `15.20 ± 1.03` |
+| **`c = 8`** | **`2,237.61 ± 2.94`** | `2,041.40 ± 4.24` | **`91.32 ± 6.81`** | **`165.00 ± 7.48`** | `12.94 ± 1.45` |
+
+### Dual-Node Power (`W` / `Wh`) & Thermal (`°C`) Telemetry (`scripts/run_power_temp_bench.py`)
+Sampled at **1 Hz** across both DGX Spark nodes (`spark-5a4e` Head + `spark-8a27` Worker) via `nvidia-smi` and `/sys/class/thermal/thermal_zone0/temp` during sustained multi-stream `llama-benchy` (`c1, c2, c4, c8`):
+
+| Node / Cluster Metric | Idle GPU Power | Active Avg GPU Power | Peak GPU Power | GPU Temp (Start $\rightarrow$ Avg / Max) | Grace SoC Temp (Avg / Max) | Avg SM Clock / GPU Util |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Head Node (`spark-5a4e`, Rank 0)** | `16.37 – 16.82 W` | **`35.21 – 36.22 W`** | **`62.36 – 63.90 W`** | `45.0°C` $\rightarrow$ **`60.8°C` / `69.0°C`** | `76.9°C` / `84.9°C` | `2,535 MHz` (`94.9%`) |
+| **Worker Node (`spark-8a27`, Rank 1)** | `16.34 – 16.42 W` | **`35.37 W`** | **`62.72 W`** | `48.7°C` $\rightarrow$ **`58.5°C` / `64.0°C`** | `68.9°C` / `75.7°C` | `2,559 MHz` (`95.2%`) |
+| **2x DGX Spark Cluster Total (`TP=2`)** | **`33.16 W`** | **`70.53 – 72.44 W`** | **`102.67 – 126.62 W`** | Max **`69.0°C`** | Max **`84.9°C`** | **`~34.4 Wh`** (`123.7 kJ`) per 29.2m `tool-eval-bench` suite |
 
 ### Category-by-Category Breakdown (`tool-eval-bench --hardmode --seed 42`)
 - **14 of 16 Categories at 100% (`PASS`):**
@@ -166,6 +183,7 @@ spark-glm53/
 │   ├── start_engine.sh             # Universal 2x DGX Spark TP=2 launcher + Go Control Plane startup
 │   ├── fetch_nvidia_ckpt.sh        # O_DIRECT / POSIX_FADV_DONTNEED page-cache-safe checkpoint downloader
 │   ├── benchmark_suite.py          # TTFT, 1..8 stream prose/code tok/s, determinism, GSM8K/HumanEval
+│   ├── run_power_temp_bench.py     # 1 Hz dual-node power (Watts/Wh) & thermal (°C) telemetry wrapper
 │   └── verify_gate4.py             # Multi-turn 64K prefix reuse, Hermes 20-tool gauntlet & stream abort tests
 ├── pkg/
 │   ├── shmdaemon/main.go           # Persistent POSIX /dev/shm O_DIRECT weight server (spark-shm-weights)
