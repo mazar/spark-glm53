@@ -288,27 +288,53 @@ if [[ "$VERIFY" == "1" ]]; then
   log "  Concurrent Bi-Dir Rail 1:           ${bw1} Gbps"
   log "  Aggregate Concurrent Bi-Rail:       ${agg_bw} Gbps"
 
-  # 4c. Check Free / Available UMA on both nodes (>112 GiB requirement)
+  # 4c. Check Free / Available UMA on both nodes (>112 GiB requirement including any pre-pinned weight slabs)
   head_avail_gib=$(awk '/^MemAvailable:/ { printf "%.2f", $2 / 1048576 }' /proc/meminfo)
   head_free_gib=$(awk '/^MemFree:/ { printf "%.2f", $2 / 1048576 }' /proc/meminfo)
+  head_pinned_gib=$(python3 -c '
+import json, os
+g = 0.0
+if os.path.exists("/dev/shm/glm53_rank_0.safetensors.cudaipc.json"):
+    with open("/dev/shm/glm53_rank_0.safetensors.cudaipc.json") as f:
+        g += float(json.load(f).get("total_cuda_gib", 0.0))
+elif os.path.exists("/dev/shm/glm53_rank_0.safetensors"):
+    st = os.stat("/dev/shm/glm53_rank_0.safetensors")
+    g += (st.st_blocks * 512) / (1024**3)
+print(f"{g:.2f}")
+' 2>/dev/null || echo "0.00")
+
   worker_mem=$(ssh -o BatchMode=yes "$WORKER_HOST" "awk '/^MemFree:/ {f=\$2/1048576} /^MemAvailable:/ {a=\$2/1048576} END {printf \"%.2f %.2f\", f, a}' /proc/meminfo")
   worker_free_gib="${worker_mem%% *}"
   worker_avail_gib="${worker_mem##* }"
+  worker_pinned_gib=$(ssh -o BatchMode=yes "$WORKER_HOST" "python3 -c '
+import json, os
+g = 0.0
+if os.path.exists(\"/dev/shm/glm53_rank_1.safetensors.cudaipc.json\"):
+    with open(\"/dev/shm/glm53_rank_1.safetensors.cudaipc.json\") as f:
+        g += float(json.load(f).get(\"total_cuda_gib\", 0.0))
+elif os.path.exists(\"/dev/shm/glm53_rank_1.safetensors\"):
+    st = os.stat(\"/dev/shm/glm53_rank_1.safetensors\")
+    g += (st.st_blocks * 512) / (1024**3)
+print(f\"{g:.2f}\")
+'" 2>/dev/null || echo "0.00")
+
+  head_eff_gib=$(awk -v a="$head_avail_gib" -v p="$head_pinned_gib" 'BEGIN { printf "%.2f", a + p }')
+  worker_eff_gib=$(awk -v a="$worker_avail_gib" -v p="$worker_pinned_gib" 'BEGIN { printf "%.2f", a + p }')
 
   log "UMA Memory Status:"
-  log "  Head ($(hostname)):   MemFree=${head_free_gib} GiB | MemAvailable=${head_avail_gib} GiB"
-  log "  Worker ($WORKER_HOST): MemFree=${worker_free_gib} GiB | MemAvailable=${worker_avail_gib} GiB"
+  log "  Head ($(hostname)):   MemFree=${head_free_gib} GiB | MemAvailable=${head_avail_gib} GiB (+ ${head_pinned_gib} GiB pinned weights = ${head_eff_gib} GiB usable)"
+  log "  Worker ($WORKER_HOST): MemFree=${worker_free_gib} GiB | MemAvailable=${worker_avail_gib} GiB (+ ${worker_pinned_gib} GiB pinned weights = ${worker_eff_gib} GiB usable)"
 
-  # Validate Gate 1 thresholds (>= 215 Gbps aggregate RDMA & > 112 GiB available UMA per node)
-  awk -v bw="$agg_bw" -v ha="$head_avail_gib" -v wa="$worker_avail_gib" 'BEGIN {
+  # Validate Gate 1 thresholds (>= 215 Gbps aggregate RDMA & > 112 GiB usable UMA per node)
+  awk -v bw="$agg_bw" -v ha="$head_eff_gib" -v wa="$worker_eff_gib" 'BEGIN {
     if (bw < 215.0) {
       printf "[GATE 1 FAIL] Aggregate RDMA bandwidth %.2f Gbps is below 215.0 Gbps threshold!\n", bw > "/dev/stderr"
       exit 1
     }
     if (ha < 112.0 || wa < 112.0) {
-      printf "[GATE 1 FAIL] Available UMA (Head=%.2f GiB, Worker=%.2f GiB) is below 112.0 GiB!\n", ha, wa > "/dev/stderr"
+      printf "[GATE 1 FAIL] Usable UMA (Head=%.2f GiB, Worker=%.2f GiB) is below 112.0 GiB!\n", ha, wa > "/dev/stderr"
       exit 1
     }
   }'
-  log "GATE 1 PASSED: Dual-Rail RoCE v2 (Solo Sum ${solo_sum_bw} Gbps / Bi-Dir ${agg_bw} Gbps >= 215 Gbps) & Contiguous Free UMA (Head ${head_avail_gib} GiB, Worker ${worker_avail_gib} GiB > 112 GiB)"
+  log "GATE 1 PASSED: Dual-Rail RoCE v2 (Solo Sum ${solo_sum_bw} Gbps / Bi-Dir ${agg_bw} Gbps >= 215 Gbps) & Usable UMA (Head ${head_eff_gib} GiB, Worker ${worker_eff_gib} GiB > 112 GiB)"
 fi
