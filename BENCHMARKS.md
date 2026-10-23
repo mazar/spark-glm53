@@ -216,22 +216,32 @@ moe_routed ≈ 510 ms (45%), KDA ≈ 200 ms, MLA ≈ 135–170 ms, **mHC ≈ 125
 | **Total Completion Tokens** | `58,704` | `56,977` | `-2.9%` (both `Reasoning Effort: Max`) |
 
 ### 5. `llama-benchy` Multi-Stream Concurrency (`c1..c8`) & 1 Hz Dual-Node Power / Thermal Telemetry (2026-10-23)
-**Sources:** `/tmp/power_temp_llama_benchy.json`, `/tmp/power_temp_llama_benchy_dual.json` (`scripts/run_power_temp_bench.py`)
+**Sources:** `/tmp/power_temp_llama_benchy.json`, `/tmp/power_temp_llama_benchy_dual.json`, `/tmp/power_temp_tensorfold_llama_benchy.json` (`scripts/run_power_temp_bench.py`)
 
-#### A. `llama-benchy` Multi-Stream Throughput (`--exact-tg --no-cache`, Prose Corpus)
-| Concurrency | `pp512` Total `tok/s` | `pp2048` Total `tok/s` | `tg256` Avg Total `tok/s` | `tg256` Peak Total `tok/s` | `tg256` Per-Req `tok/s` | `pp512` E2E TTFT (`ms`) |
+#### A. `llama-benchy` Multi-Stream Throughput: `Spark-GLM53` (NVFP4) vs. TensorFold (`EXL3-4bpw` + `DENSE=q4`)
+| Concurrency | `Spark-GLM53` Prefill (`pp512` / `pp2048`) | TensorFold EXL3 Prefill (`pp512`) | `Spark-GLM53` Decode Avg (`tg256` Total / Req) | `Spark-GLM53` Decode Peak (`tg256` Total / Req) | TensorFold EXL3 Decode Avg (`tg256` Total / Req) | TensorFold EXL3 Decode Peak (`tg256` Total / Req) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`c = 1`** | `898.67 ± 2.78` | `1,768.63 ± 3.89` | `31.21 ± 2.73` | `49.67 ± 1.70` | `31.21 ± 2.73` | `572.99 ± 1.77` |
-| **`c = 2`** | `1,327.75 ± 16.62` | **`2,206.44 ± 5.23`** | `41.69 ± 1.84` | `76.00 ± 3.30` | `21.64 ± 1.51` | `771.10 ± 9.75` |
-| **`c = 4`** | `1,778.45 ± 2.49` | `2,033.66 ± 3.99` | `57.29 ± 2.64` | `116.00 ± 5.35` | `15.20 ± 1.03` | `1,151.13 ± 1.67` |
-| **`c = 8`** | **`2,237.61 ± 2.94`** | `2,041.40 ± 4.24` | **`91.32 ± 6.81`** | **`165.00 ± 7.48`** | `12.94 ± 1.45` | `1,829.61 ± 2.59` |
+| **`c = 1`** | `898.67` / `1,768.63 tok/s` | — *(buffered by 400ms playout)* | `31.21` / `31.21 tok/s` | `49.67` / `49.67 tok/s` | **`63.06` / `63.06 tok/s`** | `63.33` / `63.33 tok/s` |
+| **`c = 2`** | `1,327.75` / **`2,206.44 tok/s`** | `1,147.65 ± 268.46 tok/s` | `41.69` / `21.64 tok/s` | `76.00` / `40.00 tok/s` | **`82.10` / `43.48 tok/s`** | `88.00` / `44.00 tok/s` |
+| **`c = 4`** | `1,778.45` / `2,033.66 tok/s` | `1,786.32 ± 324.40 tok/s` | `57.29` / `15.20 tok/s` | **`116.00`** / **`31.50 tok/s`** | **`105.14` / `28.06 tok/s`** | `113.67` / `28.42 tok/s` |
+| **`c = 8`** | **`2,237.61`** / `2,041.40 tok/s` | `1,686.10 ± 3.84 tok/s` | `91.32` / `12.94 tok/s` | **`165.00`** / **`27.67 tok/s`** | **`130.79` / `18.62 tok/s`** | `152.33` / `19.12 tok/s` |
 
 #### B. 1 Hz Dual-Node Power (`W` / `Wh` / `J`) & Thermal (`°C`) Telemetry (`spark-5a4e` + `spark-8a27`)
-| Node / Metric | Idle GPU Power | Active Avg GPU Power | Peak GPU Power | Energy (`268.4s`, 3 Runs `c1..c8`) | GPU Temp (Start $\rightarrow$ Avg / Max) | Grace SoC Temp (Avg / Max) | Avg SM Clock / GPU Util |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Head Node (`spark-5a4e`, Rank 0)** | `16.37 – 16.82 W` | **`35.21 – 36.22 W`** | **`62.36 – 63.90 W`** | `2.7008 Wh` (`9,722.8 J`) | `45.0°C` $\rightarrow$ **`60.8°C` / `69.0°C`** | `76.9°C` / `84.9°C` | `2,535 MHz` (`94.9%`) |
-| **Worker Node (`spark-8a27`, Rank 1)** | `16.34 – 16.42 W` | **`35.37 W`** | **`62.72 W`** | `2.7127 Wh` (`9,765.8 J`) | `48.7°C` $\rightarrow$ **`58.5°C` / `64.0°C`** | `68.9°C` / `75.7°C` | `2,559 MHz` (`95.2%`) |
-| **2x DGX Spark Cluster Total (`TP=2`)** | **`33.16 W`** | **`70.53 – 72.44 W`** | **`102.67 – 126.62 W`** | **`5.4135 Wh` (`19,488.6 J`)** | Max **`69.0°C`** | Max **`84.9°C`** | **`~34.4 Wh`** (`123.7 kJ`) est. for full 29.2m `tool-eval-bench` |
+| Metric (`spark-5a4e` Head + `spark-8a27` Worker) | `Spark-GLM53` (`NVFP4` + `B12X` + `DFlash2`) | TensorFold (`GLM-5.3-Flash-EXL3-4bpw` + `DENSE=q4`) | `Spark-GLM53` Advantage |
+| :--- | :--- | :--- | :--- |
+| **Cluster Idle GPU Power (`TP=2`)** | **`33.16 W`** (`16.82 W` + `16.34 W`) | `34.39 W` (`17.57 W` + `16.82 W`) | **-1.23 W** |
+| **Head Node (`spark-5a4e`) Active Avg / Peak Power** | **`35.21 – 36.22 W` avg** / **`62.36 – 63.90 W` peak** | `60.57 W` avg / `84.75 W` peak | **-41.9% lower avg power** |
+| **Worker Node (`spark-8a27`) Active Avg / Peak Power**| **`35.37 W` avg** / **`62.72 W` peak** | `61.48 W` avg / `83.57 W` peak | **-42.5% lower avg power** |
+| **Cluster Total Active Avg GPU Power (`TP=2`)** | **`70.53 – 72.44 W`** | `122.05 W` | **-42.2% lower power (-51.5 W)** |
+| **Cluster Total Peak Simultaneous GPU Power** | **`102.67 – 126.62 W`** | `147.92 W` (`168.32 W` node peak sum) | **-30.6% lower peak power** |
+| **Head GPU Temperature (Start $\rightarrow$ Avg / Max)** | `45.0°C` $\rightarrow$ **`57.3–60.8°C` avg / `63.0–69.0°C` max** | `53.0°C` $\rightarrow$ `70.5°C` avg / `79.0°C` max | **-10.0°C to -16.0°C cooler GPU** |
+| **Worker GPU Temperature (Start $\rightarrow$ Avg / Max)**| `48.7°C` $\rightarrow$ **`58.5°C` avg / `64.0°C` max** | `52.0°C` $\rightarrow$ `69.3°C` avg / `78.0°C` max | **-14.0°C cooler GPU** |
+| **Head Grace SoC Temp (Avg / Max)** | **`76.9–81.7°C` avg / `84.9–94.3°C` max** | `82.2°C` avg / `95.7°C` max | **Cooler SoC** |
+| **Worker Grace SoC Temp (Avg / Max)** | **`68.9°C` avg / `75.7°C` max** | `78.6°C` avg / `85.1°C` max | **-9.4°C cooler SoC** |
+| **Average SM Clock (Head / Worker)** | **`2,535 MHz` / `2,559 MHz`** | `2,498 MHz` / `2,529 MHz` (thermal throttle) | **+30–37 MHz higher sustained boost**|
+| **API Control-Plane Latency (`llama-benchy` probe)** | **`2.95 – 3.26 ms`** (Compiled Go Gateway) | `42.42 ms` (Python HTTP server) | **13.5x lower API overhead** |
+| **FP8 KV Cache Pool at `PARALLEL=8`** | **`2,263,389` tokens** | `1,214,464` tokens | **1.86x larger multi-stream KV pool**|
+| **Restart / Weight Load Time** | **`1.50 – 1.60 s`** (CUDA IPC) / **`0.87 s`** (`shm`) | `120.7 – 126.0 s` (`2m 15.7s` total) | **~80x – 140x faster restart** |
 
 
 
