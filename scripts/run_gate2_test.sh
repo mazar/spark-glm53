@@ -2,9 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKER_HOST="spark-8a27"
-MASTER_ADDR="10.100.240.1"
-MASTER_PORT="29550"
+HOST_HOME="${HOST_HOME:-$HOME}"
+WORKER_HOST="${WORKER_HOST:-10.100.240.2}"
+MASTER_ADDR="${MASTER_ADDR:-10.100.240.1}"
+MASTER_PORT="${MASTER_PORT:-29550}"
 
 # 1. Sync files to Worker node
 ssh -o BatchMode=yes "$WORKER_HOST" "mkdir -p $ROOT_DIR/worker $ROOT_DIR/scripts $ROOT_DIR/bin"
@@ -18,8 +19,8 @@ if ! "$ROOT_DIR/bin/spark-shm-weights" --rank 0 --status >/dev/null 2>&1; then
   pkill -x spark-shm-weights >/dev/null 2>&1 || true
   docker run -d --name spark-shm-weights --restart unless-stopped \
     --ipc=host --privileged --ulimit memlock=-1:-1 \
-    -v /tmp:/tmp -v /home/massoud:/home/massoud \
-    -v /home/massoud/.cache/huggingface:/root/.cache/huggingface \
+    -v /tmp:/tmp -v "$HOST_HOME:$HOST_HOME" \
+    -v "$HOST_HOME/.cache/huggingface:/root/.cache/huggingface" \
     --entrypoint "$ROOT_DIR/bin/spark-shm-weights" \
     vllm-node-b12x:latest --rank 0 >/dev/null
   sleep 2
@@ -30,8 +31,8 @@ ssh -o BatchMode=yes "$WORKER_HOST" "
     pkill -x spark-shm-weights >/dev/null 2>&1 || true
     docker run -d --name spark-shm-weights --restart unless-stopped \
       --ipc=host --privileged --ulimit memlock=-1:-1 \
-      -v /tmp:/tmp -v /home/massoud:/home/massoud \
-      -v /home/massoud/.cache/huggingface:/root/.cache/huggingface \
+      -v /tmp:/tmp -v $HOST_HOME:$HOST_HOME \
+      -v $HOST_HOME/.cache/huggingface:/root/.cache/huggingface \
       --entrypoint $ROOT_DIR/bin/spark-shm-weights \
       vllm-node-b12x:latest --rank 1 >/dev/null
     sleep 2
@@ -43,7 +44,7 @@ run_tp2_pass() {
   local port="$2"
   echo ""
   echo "=================================================================="
-  echo "  Running Gate 2 Pass: $label (TP=2 across spark-5a4e & spark-8a27)"
+  echo "  Running Gate 2 Pass: $label (TP=2 across $(hostname) & $WORKER_HOST)"
   echo "=================================================================="
 
   # Clean any prior gate2 container
@@ -55,7 +56,7 @@ run_tp2_pass() {
     docker run -d --name glm53-gate2-worker \
       --gpus all --ipc=host --network=host --privileged \
       --ulimit memlock=-1:-1 \
-      -v /home/massoud/.cache/huggingface:/root/.cache/huggingface \
+      -v $HOST_HOME/.cache/huggingface:/root/.cache/huggingface \
       -v /tmp:/tmp \
       -v $ROOT_DIR:/workspace \
       -e GLOO_SOCKET_IFNAME=enp1s0f1np1 \
@@ -75,7 +76,7 @@ run_tp2_pass() {
   docker run --rm --name glm53-gate2-head \
     --gpus all --ipc=host --network=host --privileged \
     --ulimit memlock=-1:-1 \
-    -v /home/massoud/.cache/huggingface:/root/.cache/huggingface \
+    -v "$HOST_HOME/.cache/huggingface:/root/.cache/huggingface" \
     -v /tmp:/tmp \
     -v "$ROOT_DIR:/workspace" \
     -e GLOO_SOCKET_IFNAME=enp1s0f1np1 \

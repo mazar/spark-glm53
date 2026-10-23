@@ -1149,12 +1149,25 @@ def install_shm_patches() -> None:
         _orig_measure(self)
         if not _SHM_CLAIMED_BY_WORKER:
             shm_sz = 0
-            for sp in (get_rank_shm_path(), get_dflash2_shm_path()):
-                if os.path.exists(sp) and (_is_cuda_ipc_daemon_alive(sp) or _is_shm_file_nonsparse(sp)):
+            rank_p = get_rank_shm_path()
+            if os.path.exists(rank_p):
+                if _is_cuda_ipc_daemon_alive(rank_p):
                     try:
-                        shm_sz += os.path.getsize(sp)
+                        st = os.stat(rank_p)
+                        shm_sz += int(st.st_size) + int(st.st_blocks * 512) + (640 * 1024 * 1024)
                     except Exception:
                         pass
+                elif _is_shm_file_nonsparse(rank_p):
+                    try:
+                        shm_sz += os.path.getsize(rank_p)
+                    except Exception:
+                        pass
+            dflash_p = get_dflash2_shm_path()
+            if os.path.exists(dflash_p) and _is_shm_file_nonsparse(dflash_p):
+                try:
+                    shm_sz += os.path.getsize(dflash_p)
+                except Exception:
+                    pass
             if shm_sz > 0:
                 self.free_memory = min(int(self.total_memory), int(self.free_memory) + int(shm_sz))
                 self.cuda_memory = self.total_memory - self.free_memory

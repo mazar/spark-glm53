@@ -176,6 +176,83 @@ def install_b12x_compiler_worker_patches() -> None:
     except Exception:
         pass
 
+    try:
+        import b12x.moe.fused_moe._impl as b12x_moe_impl
+        import b12x.moe.fused_moe._tuning as b12x_moe_tuning
+
+        if not getattr(b12x_moe_tuning, "_spark_patched", False):
+            orig_select_tile_mn = b12x_moe_impl._select_dynamic_tile_mn
+
+            def _patched_select_dynamic_tile_mn(
+                routed_rows: int,
+                n: int,
+                quant_mode: str = "nvfp4",
+                *,
+                num_experts: int,
+                activation: str = "silu",
+                compute_capability: tuple[int, int] | None = None,
+                planned_tile_m: int | None = None,
+            ) -> tuple[int, int]:
+                tile_m, tile_n = orig_select_tile_mn(
+                    routed_rows,
+                    n,
+                    quant_mode,
+                    num_experts=num_experts,
+                    activation=activation,
+                    compute_capability=compute_capability,
+                    planned_tile_m=planned_tile_m,
+                )
+                if (
+                    planned_tile_m is None
+                    and b12x_moe_impl._dynamic_tile_mn_override() is None
+                    and quant_mode in ("nvfp4", "nvfp4_auto")
+                    and tile_m > 64
+                ):
+                    tile_m = 64
+                return (tile_m, tile_n)
+
+            b12x_moe_impl._select_dynamic_tile_mn = _patched_select_dynamic_tile_mn
+
+            orig_heuristic = b12x_moe_impl._heuristic_moe_decode_config
+
+            def _patched_heuristic_moe_decode_config(query: Any, device: Any) -> Any:
+                if getattr(query, "quant_mode", None) == "nvfp4_auto":
+                    query = replace(query, quant_mode="nvfp4")
+                cfg = orig_heuristic(query, device)
+                if (
+                    getattr(cfg, "backend", None) == "dynamic"
+                    and getattr(cfg, "dynamic_tile_m", None) is not None
+                    and int(cfg.dynamic_tile_m) > 64
+                ):
+                    cfg = replace(cfg, dynamic_tile_m=64)
+                if getattr(cfg, "nvfp4_materialize_intermediate", False):
+                    cfg = replace(cfg, nvfp4_materialize_intermediate=False)
+                return cfg
+
+            b12x_moe_impl._heuristic_moe_decode_config = _patched_heuristic_moe_decode_config
+
+            orig_moe_default_config = b12x_moe_tuning._default_config
+
+            def _patched_moe_default_config(query: Any, device: Any) -> Any:
+                cfg = orig_moe_default_config(query, device)
+                if (
+                    getattr(cfg, "backend", None) == "dynamic"
+                    and getattr(cfg, "dynamic_tile_m", None) is not None
+                    and int(cfg.dynamic_tile_m) > 64
+                ):
+                    cfg = replace(cfg, dynamic_tile_m=64)
+                if getattr(cfg, "nvfp4_materialize_intermediate", False):
+                    cfg = replace(cfg, nvfp4_materialize_intermediate=False)
+                return cfg
+
+            b12x_moe_tuning._default_config = _patched_moe_default_config
+            object.__setattr__(
+                b12x_moe_tuning.TUNING, "default_config", _patched_moe_default_config
+            )
+            b12x_moe_tuning._spark_patched = True
+    except Exception:
+        pass
+
 
 # Apply env vars immediately on module import
 configure_spark_env()
@@ -447,11 +524,7 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                 self, context_states, context_positions, context_slot_mapping
             )
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        start_idx = 0
-        if getattr(self, "_spark_single_req_window", False) and num_ctx > chunk_sz:
-            start_idx = num_ctx - chunk_sz
-            self._spark_single_req_window = False
-        for c_start in range(start_idx, num_ctx, chunk_sz):
+        for c_start in range(0, num_ctx, chunk_sz):
             c_end = min(c_start + chunk_sz, num_ctx)
             if context_slot_mapping is None:
                 sub_slot = None
@@ -854,7 +927,10 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
     orig_load_model = GPUModelRunner.load_model
 
     try:
-        from vllm.v1.worker.gpu.cudagraph_utils import ModelCudaGraphManager
+        from vllm.v1.worker.gpu.cudagraph_utils import (
+            BatchExecutionDescriptor,
+            ModelCudaGraphManager,
+        )
         import vllm.v1.worker.gpu.spec_decode.utils as _sd_utils_mod
         import vllm.v1.worker.gpu.model_runner as _mr_sd_mod
 
@@ -890,6 +966,7 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             *mcg_args: Any,
             **mcg_kwargs: Any,
         ) -> None:
+            orig_decode_query_len = int(decode_query_len)
             dflash_qlen = int(os.getenv("SPARK_DFLASH_STEPS", "7")) + 1
             if decode_query_len > dflash_qlen:
                 decode_query_len = dflash_qlen
@@ -902,6 +979,27 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                 *mcg_args,
                 **mcg_kwargs,
             )
+            if (
+                orig_decode_query_len > decode_query_len
+                and CUDAGraphMode.FULL in getattr(self, "_capture_descs", {})
+            ):
+                extra_desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.FULL,
+                    num_tokens=orig_decode_query_len,
+                    num_reqs=1,
+                    uniform_token_count=orig_decode_query_len,
+                    num_active_loras=0,
+                )
+                full_descs = self._capture_descs[CUDAGraphMode.FULL]
+                if extra_desc not in full_descs:
+                    full_descs.append(extra_desc)
+                    full_descs.sort(
+                        key=lambda d: (d.num_tokens, d.num_reqs or 0, d.num_active_loras)
+                    )
+                for n_t in range(decode_query_len + 1, orig_decode_query_len + 1):
+                    cand_list = self._candidates.get((n_t, 0))
+                    if cand_list is not None and extra_desc not in cand_list:
+                        cand_list.insert(0, extra_desc)
 
         ModelCudaGraphManager.__init__ = _patched_mcg_init
 
@@ -980,6 +1078,21 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
         return orig_gen_draft(self, *g_a, **g_kw)
 
     DFlashSpeculator._generate_draft = _patched_gen_draft
+    try:
+        from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator
+
+        orig_gen_draft2 = DFlash2Speculator._generate_draft
+
+        def _patched_gen_draft2(
+            self: DFlash2Speculator, *g_a: Any, **g_kw: Any
+        ) -> Any:
+            if getattr(self, "_spark_skip_draft_fwd", False):
+                return None
+            return orig_gen_draft2(self, *g_a, **g_kw)
+
+        DFlash2Speculator._generate_draft = _patched_gen_draft2
+    except Exception:
+        pass
 
     orig_propose = DFlashSpeculator.propose
 
@@ -1020,8 +1133,10 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             return self.draft_tokens[:num_reqs]
 
         ev_p0 = ev_p1 = ev_p2 = None
+        warmup_done = getattr(self, "_spark_warmup_done", False)
         record_prop = (
-            not dummy_run
+            warmup_done
+            and not dummy_run
             and not is_profile
             and os.getenv("SPARK_PROFILE_STEPS", "1") == "1"
             and (getattr(self, "_spark_prop_cnt", 0) < 28 or num_target_tokens >= 512)
@@ -1034,9 +1149,12 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             ev_p0.record()
 
         uncond_draft = None
+        saved_uncond_draft = None
         if (
-            not dummy_run
+            warmup_done
+            and not dummy_run
             and not is_profile
+            and not getattr(self, "_spark_skip_draft_fwd_chunk", False)
             and getattr(self, "copy_drafter", None) is not None
             and getattr(self, "req_states", None) is not None
             and num_reqs > 0
@@ -1053,11 +1171,7 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             if uncond_draft is not None:
                 if getattr(self, "_spark_is_homogeneous_greedy", False) and num_reqs > 1:
                     uncond_draft[1:num_reqs].copy_(uncond_draft[0:1])
-                if ev_p1 is not None and ev_p2 is not None:
-                    ev_p1.record()
-                    ev_p2.record()
-                    self._spark_last_prop_events = (ev_p0, ev_p1, ev_p2)
-                return uncond_draft
+                saved_uncond_draft = uncond_draft[:num_reqs].clone()
 
         if (
             aux_hidden_states is not None
@@ -1067,13 +1181,7 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             and hasattr(self.model, "combine_hidden_states")
         ):
             chunk_sz = 2048
-            start_tok = 0
-            if not dummy_run and not is_profile and num_reqs == 1 and num_target_tokens > chunk_sz:
-                start_tok = num_target_tokens - chunk_sz
-                inner_m = getattr(self.model, "model", None)
-                if inner_m is not None:
-                    inner_m._spark_single_req_window = True
-            for c_start in range(start_tok, num_target_tokens, chunk_sz):
+            for c_start in range(0, num_target_tokens, chunk_sz):
                 c_end = min(c_start + chunk_sz, num_target_tokens)
                 cat_chunk = torch.cat(
                     [h[c_start:c_end] for h in aux_hidden_states], dim=-1
@@ -1082,14 +1190,25 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                     self.model.combine_hidden_states(cat_chunk)
                 )
                 del cat_chunk
+            if isinstance(aux_hidden_states, list):
+                aux_hidden_states.clear()
             last_hidden_states = self.hidden_states
             aux_hidden_states = None
 
         q_cg = getattr(self, "query_cudagraph_manager", None)
-        if uncond_draft is not None:
+        skip_draft_fwd = (uncond_draft is not None) or bool(
+            getattr(self, "_spark_skip_draft_fwd_chunk", False)
+        )
+        self._spark_skip_draft_fwd_chunk = False
+        if skip_draft_fwd:
             self._spark_skip_draft_fwd = True
             if q_cg is not None:
                 q_cg._spark_skip_draft_fwd = True
+        if "num_speculative_tokens" in kwargs:
+            kwargs["num_speculative_tokens"] = min(
+                int(kwargs["num_speculative_tokens"]),
+                int(self.num_speculative_steps),
+            )
         try:
             draft_out = orig_propose(
                 self,
@@ -1102,16 +1221,26 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                 **kwargs,
             )
         finally:
-            if uncond_draft is not None:
+            if skip_draft_fwd:
                 self._spark_skip_draft_fwd = False
                 if q_cg is not None:
                     q_cg._spark_skip_draft_fwd = False
+
+        if saved_uncond_draft is not None:
+            self.draft_tokens[:num_reqs].copy_(saved_uncond_draft)
+            draft_out = self.draft_tokens[:num_reqs]
+            if ev_p1 is not None and ev_p2 is not None:
+                ev_p1.record()
+                ev_p2.record()
+                self._spark_last_prop_events = (ev_p0, ev_p1, ev_p2)
+            return draft_out
 
         if ev_p1 is not None:
             ev_p1.record()
 
         if (
-            uncond_draft is None
+            warmup_done
+            and uncond_draft is None
             and not dummy_run
             and not is_profile
             and getattr(self, "copy_drafter", None) is not None
@@ -1228,6 +1357,10 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                 if cd is not None and hasattr(cd, "commit_staged_history"):
                     cd.commit_staged_history()
             for nr in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+                if not str(nr.req_id).startswith("_"):
+                    self._spark_warmup_done = True
+                    if getattr(self, "speculator", None) is not None:
+                        self.speculator._spark_warmup_done = True
                 prefill_toks = (
                     getattr(nr, "prefill_token_ids", None)
                     or getattr(nr, "prompt_token_ids", None)
@@ -1258,11 +1391,17 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                             pass
                     end_pos = comp_toks + n_sched
                     meta[2] = end_pos
+                    skip_draft_chunk = False
                     if p_len > 0 and max_toks == 1:
                         skip_bc = True
-                    if p_len > 0 and (max_toks == 1 or end_pos < p_len):
                         scheduler_output.num_spec_tokens_to_schedule = 0
                         skip_aux = True
+                    elif p_len > 0 and end_pos < p_len:
+                        skip_bc = True
+                        scheduler_output.num_spec_tokens_to_schedule = 0
+                        skip_draft_chunk = True
+                    if self.speculator is not None and not dummy_run:
+                        self.speculator._spark_skip_draft_fwd_chunk = skip_draft_chunk
             elif len(sched_map) > 1:
                 cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
                 c_ids = getattr(cached_reqs, "req_ids", None) or ()
@@ -1309,17 +1448,19 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
         if self.speculator is not None and not dummy_run:
             self.speculator._spark_skip_propose = skip_aux
 
+        warmup_done = getattr(self, "_spark_warmup_done", False)
         step_cnt = getattr(self, "_spark_step_cnt", 0)
-        if not dummy_run and n_toks > 0:
+        if warmup_done and not dummy_run and n_toks > 0:
             self._spark_step_cnt = step_cnt + 1
             self._spark_last_exec_toks = n_toks
             if n_toks >= 512:
-                max_seen = getattr(self, "_spark_max_seen_toks", 0)
-                if n_toks > max_seen:
+                last_pref = getattr(self, "_spark_last_prefill_toks", 0)
+                if n_toks != last_pref:
                     torch.cuda.empty_cache()
-                    self._spark_max_seen_toks = n_toks
+                self._spark_last_prefill_toks = n_toks
         prof_enabled = (
-            not dummy_run
+            warmup_done
+            and not dummy_run
             and os.getenv("SPARK_PROFILE_STEPS", "1") == "1"
             and n_toks > 0
         )
@@ -1466,7 +1607,14 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
         try:
             prof = getattr(self, "_spark_active_profile", None)
             if prof is None:
-                return orig_sample_tokens(self, grammar_output, *args, **kwargs)
+                res = orig_sample_tokens(self, grammar_output, *args, **kwargs)
+                if getattr(self, "_spark_last_exec_toks", 0) > 64 or grammar_output is not None:
+                    if (
+                        torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                        > 64 * 1024 * 1024
+                    ):
+                        torch.cuda.empty_cache()
+                return res
 
             self._spark_active_profile = None
             step_cnt, n_toks, t0, t1, ev0, ev1, sub_ev = prof
@@ -1476,6 +1624,12 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             ev2.record()
             t3 = time.perf_counter()
             ev2.synchronize()
+            if n_toks >= 512:
+                if (
+                    torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                    > 64 * 1024 * 1024
+                ):
+                    torch.cuda.empty_cache()
             fwd_gpu_ms = ev0.elapsed_time(ev1)
             samp_prop_gpu_ms = ev1.elapsed_time(ev2)
             tot_gpu_ms = ev0.elapsed_time(ev2)
@@ -1549,6 +1703,18 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
     try:
         from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 
+        orig_spec_capture = DFlashSpeculator.capture
+
+        def _patched_spec_capture(
+            self: DFlashSpeculator, *args: Any, **kwargs: Any
+        ) -> Any:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            return orig_spec_capture(self, *args, **kwargs)
+
+        DFlashSpeculator.capture = _patched_spec_capture
+
         orig_capture_model = GPUModelRunner.capture_model
 
         def _patched_capture_model(
@@ -1570,11 +1736,8 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
                 if not profile_only:
                     set_cudagraph_capturing_enabled(False)
                 self._spark_last_large_toks = -1
-                gc.collect()
                 if torch.cuda.is_available():
-                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
-                drop_file_page_cache()
 
         GPUModelRunner.capture_model = _patched_capture_model
     except Exception:
@@ -1594,6 +1757,40 @@ def _patch_scheduler_and_boundary_checkpoints() -> None:
     """
     import queue
     import time
+
+    try:
+        import vllm.config.vllm as vllm_cfg_mod
+
+        orig_glm_kda_rec_unavail = getattr(
+            vllm_cfg_mod, "_glm_kda_recovery_unavailable", None
+        )
+        if orig_glm_kda_rec_unavail is not None and not getattr(
+            vllm_cfg_mod, "_spark_patched_kda_rec", False
+        ):
+
+            def _patched_glm_kda_recovery_unavailable(config: Any) -> str | None:
+                reason = orig_glm_kda_rec_unavail(config)
+                if reason == "requires MTP or DFlash with 1 to 7 draft tokens":
+                    spec = getattr(config, "speculative_config", None)
+                    num_spec = int(getattr(config, "num_speculative_tokens", 0) or 0)
+                    if (
+                        spec is not None
+                        and getattr(spec, "method", None) in ("mtp", "dflash")
+                        and 1 <= num_spec <= 31
+                    ):
+                        object.__setattr__(spec, "num_speculative_tokens", 7)
+                        try:
+                            return orig_glm_kda_rec_unavail(config)
+                        finally:
+                            object.__setattr__(spec, "num_speculative_tokens", num_spec)
+                return reason
+
+            vllm_cfg_mod._glm_kda_recovery_unavailable = (
+                _patched_glm_kda_recovery_unavailable
+            )
+            vllm_cfg_mod._spark_patched_kda_rec = True
+    except Exception:
+        pass
 
     try:
         from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -1638,34 +1835,26 @@ def _patch_scheduler_and_boundary_checkpoints() -> None:
         pass
 
     try:
-        import vllm.model_executor.warmup.b12x_prepare as b12x_prep_mod
+        import vllm.v1.core.kv_cache_utils as kv_utils_mod
 
-        orig_module_workload = b12x_prep_mod._module_workload
+        orig_get_bytes_per_block = kv_utils_mod._get_kv_cache_bytes_per_block
 
-        def _patched_module_workload(module: Any, workload: Any) -> Any:
-            wl = orig_module_workload(module, workload)
-            if (
-                getattr(wl, "lane", 0) != 0
-                and module.__class__.__name__ == "ParallelLMHead"
-            ):
-                cand_counts = {
-                    reqs * 7 for reqs in range(1, min(int(wl.max_seqs), 16) + 1)
-                }
-                new_counts = tuple(sorted(set(wl.token_counts) | cand_counts))
-                new_fixed = tuple(
-                    sorted(
-                        set(wl.fixed_token_counts)
-                        | {c for c in cand_counts if c < int(wl.max_tokens)}
-                    )
+        def _patched_get_kv_cache_bytes_per_block(kv_cache_groups: list[Any]) -> int:
+            res = orig_get_bytes_per_block(kv_cache_groups)
+            glm_c4_index_page_bytes = 64 * 132
+            if res % glm_c4_index_page_bytes != 0:
+                contains_glm5 = kv_utils_mod._contains_glm5_next_mla(
+                    kv_utils_mod._get_per_layer_spec(group, layer_name)
+                    for group in kv_cache_groups
+                    for layer_name in group.layer_names
                 )
-                return replace(
-                    wl,
-                    token_counts=new_counts,
-                    fixed_token_counts=new_fixed,
-                )
-            return wl
+                if contains_glm5:
+                    res = (
+                        (res + glm_c4_index_page_bytes - 1) // glm_c4_index_page_bytes
+                    ) * glm_c4_index_page_bytes
+            return res
 
-        b12x_prep_mod._module_workload = _patched_module_workload
+        kv_utils_mod._get_kv_cache_bytes_per_block = _patched_get_kv_cache_bytes_per_block
     except Exception:
         pass
 
@@ -1677,25 +1866,63 @@ def _patch_scheduler_and_boundary_checkpoints() -> None:
         def _patched_add_request(self: Scheduler, request: Any) -> None:
             orig_add_request(self, request)
             if self.kv_cache_manager.boundary_checkpoints is not None:
-                sp = getattr(request, "sampling_params", None)
-                max_toks = getattr(sp, "max_tokens", None) if sp is not None else None
-                if max_toks == 1:
-                    request.recurrent_prefill_tail_boundary = None
-                elif (
-                    getattr(request, "recurrent_prefill_tail_boundary", None) is None
-                    and getattr(request, "num_prompt_tokens", 0) > 256
-                ):
-                    tail_pos = ((int(request.num_prompt_tokens) - 1) // 256) * 256
-                    inst_pos = int(getattr(request, "recurrent_instruction_boundary", None) or 0)
-                    if tail_pos > inst_pos:
-                        request.recurrent_prefill_tail_boundary = tail_pos
+                # PROMPT_CHECKPOINT_SLOT and RESPONSE_CHECKPOINT_SLOT already capture
+                # exact prompt and response endpoints without extra prefill splits.
+                # Clear mid-prompt instruction and tail boundaries so single-turn and
+                # multi-turn prefills execute in full-size chunks without splitting
+                # a short prompt into 3 separate 80 GiB MoE forward passes.
+                request.recurrent_instruction_boundary = None
+                request.recurrent_prefill_tail_boundary = None
 
         Scheduler.add_request = _patched_add_request
     except Exception:
         pass
 
     try:
-        from vllm.v1.engine.core import EngineCoreProc
+        from vllm.v1.engine.core import EngineCore, EngineCoreProc
+
+        orig_ec_step = EngineCore.step
+
+        def _patched_ec_step(self: EngineCore) -> Any:
+            if getattr(self, "async_scheduling", False) or os.getenv(
+                "SPARK_SYNC_PIPELINE_STEP", "1"
+            ) != "1":
+                return orig_ec_step(self)
+            if not self.scheduler.has_requests():
+                return {}, False
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            future, execution_timing = self._execute_model(scheduler_output)
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            if scheduler_output.total_num_scheduled_tokens > 0 and grammar_output is None:
+                sample_future = self.model_executor.sample_tokens(
+                    grammar_output, non_block=True
+                )
+                with (
+                    self.capture_iteration_details(scheduler_output) as iteration_details,
+                    self.log_error_detail(scheduler_output),
+                ):
+                    model_output = future.result()
+                    if model_output is None:
+                        model_output = sample_future.result()
+                    self._record_compute_time(scheduler_output, execution_timing)
+            else:
+                with (
+                    self.capture_iteration_details(scheduler_output) as iteration_details,
+                    self.log_error_detail(scheduler_output),
+                ):
+                    model_output = future.result()
+                    if model_output is None and scheduler_output.total_num_scheduled_tokens > 0:
+                        model_output = self.model_executor.sample_tokens(grammar_output)
+                    self._record_compute_time(scheduler_output, execution_timing)
+            self._wait_for_boundary_checkpoint_copies(model_output)
+            self._process_aborts_queue()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+            self._attach_iteration_details(engine_core_outputs, iteration_details)
+            return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+        EngineCore.step = _patched_ec_step
 
         orig_process_input_queue = EngineCoreProc._process_input_queue
 
@@ -1844,6 +2071,16 @@ def _patch_l2_prefetch_and_indexer_workspace() -> None:
 
         orig_compile_or_warmup = GPUWorker.compile_or_warm_up_model
 
+        def _close_b12x_compiler_pool(worker: GPUWorker) -> None:
+            try:
+                sess = getattr(worker, "_b12x_session", None)
+                if sess is not None and getattr(sess, "_pool", None) is not None:
+                    pool = sess._pool
+                    sess._pool = None
+                    pool.close(terminate=True)
+            except Exception:
+                pass
+
         def _patched_compile_or_warm_up_model(self: GPUWorker, *a: Any, **kw: Any) -> Any:
             gc.collect()
             if torch.cuda.is_available():
@@ -1851,6 +2088,7 @@ def _patch_l2_prefetch_and_indexer_workspace() -> None:
                 torch.cuda.empty_cache()
             drop_file_page_cache()
             res = orig_compile_or_warmup(self, *a, **kw)
+            _close_b12x_compiler_pool(self)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
@@ -1865,14 +2103,7 @@ def _patch_l2_prefetch_and_indexer_workspace() -> None:
     try:
         import b12x.moe.fused_moe._impl as b12x_moe_impl
 
-        orig_heuristic = b12x_moe_impl._heuristic_moe_decode_config
-
-        def _patched_heuristic_moe_decode_config(query: Any, device: Any) -> Any:
-            if getattr(query, "quant_mode", None) == "nvfp4_auto":
-                query = replace(query, quant_mode="nvfp4")
-            return orig_heuristic(query, device)
-
-        b12x_moe_impl._heuristic_moe_decode_config = _patched_heuristic_moe_decode_config
+        install_b12x_compiler_worker_patches()
         b12x_moe_impl._get_micro_dynamic_cutover_pairs = lambda quant_mode="nvfp4": int(
             os.getenv("B12X_MICRO_DYNAMIC_CUTOVER_PAIRS", "0")
         )
@@ -1911,12 +2142,70 @@ def _patch_l2_prefetch_and_indexer_workspace() -> None:
                 out = dict(d)
                 if out.get("max_tokens", 0) > 2048:
                     out["max_tokens"] = target_mt
+                if out.get("num_tokens", 0) > 2048:
+                    out["num_tokens"] = target_mt
+                    top_k = int(out.get("top_k", 8) or 8)
+                    if "routed_rows" in out:
+                        out["routed_rows"] = target_mt * top_k
+                    if "logits_row_stride" in out and "topk_row_stride" in out:
+                        pass
                 return out
+
+            def _sanitize_moe_assignment(
+                component_id: str, q_dict: dict[str, Any], raw_assign: dict[str, Any]
+            ) -> dict[str, Any]:
+                if component_id == "moe.decode" and int(q_dict.get("num_tokens", 0) or 0) > 2048:
+                    out = dict(raw_assign)
+                    target_tile_m = int(os.getenv("SPARK_B12X_PREFILL_TILE_M", "64"))
+                    if out.get("dynamic_tile_m") in (32, 64, 128) and out.get("dynamic_tile_m") != target_tile_m:
+                        out["dynamic_tile_m"] = target_tile_m
+                    if out.get("nvfp4_materialize_intermediate"):
+                        out["nvfp4_materialize_intermediate"] = False
+                    return out
+                return raw_assign
 
             def _patched_job_lookup(
                 self: Any, obligation: Any, selections: dict[str, Any]
             ) -> None:
-                orig_job_lookup(self, obligation, selections)
+                try:
+                    orig_job_lookup(self, obligation, selections)
+                except ValueError:
+                    obligation.selection = None
+                try:
+                    request = obligation.request
+                    configuration = obligation.configuration
+                    contract = request.plan.contract
+                    q_dict = configuration.encoded_query.to_dict()
+                    if (
+                        obligation.selection is not None
+                        and contract.component_id == "moe.decode"
+                        and int(q_dict.get("num_tokens", 0) or 0) > 2048
+                    ):
+                        cur_cfg = obligation.selection.config
+                        target_tile_m = int(os.getenv("SPARK_B12X_PREFILL_TILE_M", "64"))
+                        if (
+                            getattr(cur_cfg, "dynamic_tile_m", None) != target_tile_m
+                            or getattr(cur_cfg, "nvfp4_materialize_intermediate", False)
+                        ):
+                            raw_a = (
+                                obligation.selection.assignment.to_dict()
+                                if obligation.selection.assignment is not None
+                                else contract.config_payload(cur_cfg).to_dict()
+                            )
+                            sanitized = _sanitize_moe_assignment(
+                                contract.component_id, q_dict, raw_a
+                            )
+                            assignment = FrozenMapping(sanitized)
+                            configuration.space.validate(assignment)
+                            cfg = contract._lower(
+                                configuration.query, configuration.device, assignment
+                            )
+                            obligation.selection = self._selection(
+                                obligation, cfg, "cached", assignment
+                            )
+                            return
+                except Exception:
+                    pass
                 if obligation.selection is not None:
                     return
                 try:
@@ -1960,7 +2249,10 @@ def _patch_l2_prefetch_and_indexer_workspace() -> None:
                         )
                         rec = cache.get(alt_key)
                         if rec is not None:
-                            assignment = FrozenMapping(rec["assignment"])
+                            sanitized = _sanitize_moe_assignment(
+                                contract.component_id, q_dict, rec["assignment"]
+                            )
+                            assignment = FrozenMapping(sanitized)
                             configuration.space.validate(assignment)
                             cfg = contract._lower(
                                 configuration.query, configuration.device, assignment
@@ -2075,7 +2367,20 @@ def _patch_sparse_mla_kpool_indexer() -> None:
                     if not getattr(layer, "mhc", False) or residual is None:
                         return hidden_states
                     if getattr(self, "_spark_skip_aux", False) and not torch.cuda.is_current_stream_capturing():
-                        return hidden_states[:0]
+                        empty_aux = getattr(self, "_spark_empty_aux_buf", None)
+                        if (
+                            empty_aux is None
+                            or empty_aux.device != hidden_states.device
+                            or empty_aux.dtype != hidden_states.dtype
+                            or empty_aux.shape[-1] != hidden_states.shape[-1]
+                        ):
+                            empty_aux = torch.empty(
+                                (0, hidden_states.shape[-1]),
+                                dtype=hidden_states.dtype,
+                                device=hidden_states.device,
+                            )
+                            self._spark_empty_aux_buf = empty_aux
+                        return empty_aux
                     return fn(self, layer, hidden_states, residual, post, comb)
 
                 return _patched_prep_aux
@@ -2371,7 +2676,7 @@ def _patch_sparse_mla_kpool_indexer() -> None:
         value = tl.where(history, history_value, tail_value).to(tl.int32)
         tl.store(output + row * output_stride + column, value, mask=mask)
 
-        glm_kpool._expand_pool_ids_kernel = _safe_expand_pool_ids_kernel
+    glm_kpool._expand_pool_ids_kernel = _safe_expand_pool_ids_kernel
 
     try:
         from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
@@ -2385,6 +2690,33 @@ def _patch_sparse_mla_kpool_indexer() -> None:
                 self._sm120_graph_pool_lifetime_guard = True
 
         GateLinear.__init__ = _patched_gate_init
+    except Exception:
+        pass
+
+    try:
+        from vllm.models.glm5next.nvidia import kda as glm5_nvidia_kda
+
+        def _patched_kda_forward(
+            self: Any,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+        ) -> torch.Tensor:
+            max_overlap_tokens = int(os.getenv("SPARK_KDA_GATE_OVERLAP_MAX_TOKENS", "64"))
+            if (
+                glm5_nvidia_kda._GATE_SIDE_STREAM
+                and not self.use_full_rank_gate
+                and hidden_states.size(0) <= max_overlap_tokens
+            ):
+                gate_workspace, main_workspace = self._projection_workspaces(
+                    hidden_states.size(0)
+                )
+                if glm5_nvidia_kda._gate_overlap_allowed():
+                    return self._forward_gate_overlap(
+                        hidden_states, gate_workspace, main_workspace
+                    )
+            return self._forward_projections(hidden_states, positions)
+
+        glm5_nvidia_kda.Glm5NextLinearAttention.forward = _patched_kda_forward
     except Exception:
         pass
 
@@ -2428,10 +2760,67 @@ def _patch_sparse_mla_kpool_indexer() -> None:
         pass
 
 
+_GPU_WORKER_PATCHES_INSTALLED = False
+
+
+def install_gpu_worker_patches() -> None:
+    """Install heavy GPU / B12X / safetensors / DFlash2 patches inside WorkerProcs only."""
+    global _GPU_WORKER_PATCHES_INSTALLED
+    if _GPU_WORKER_PATCHES_INSTALLED:
+        return
+    _GPU_WORKER_PATCHES_INSTALLED = True
+
+    from worker.shm_safetensors import install_shm_patches
+
+    install_shm_patches()
+    _patch_l2_prefetch_and_indexer_workspace()
+    _patch_dflash_attn_sm121a()
+    _patch_dflash_kv_cache_and_block_size()
+    _patch_dflash2_context_cudagraph_and_copy_drafter()
+    _patch_sparse_mla_kpool_indexer()
+    try:
+        import vllm.model_executor.warmup.b12x_prepare as b12x_prep_mod
+
+        orig_module_workload = b12x_prep_mod._module_workload
+
+        def _patched_module_workload(module: Any, workload: Any) -> Any:
+            wl = orig_module_workload(module, workload)
+            if (
+                getattr(wl, "lane", 0) != 0
+                and module.__class__.__name__ == "ParallelLMHead"
+            ):
+                cand_counts = {
+                    reqs * 7 for reqs in range(1, min(int(wl.max_seqs), 16) + 1)
+                }
+                new_counts = tuple(sorted(set(wl.token_counts) | cand_counts))
+                new_fixed = tuple(
+                    sorted(
+                        set(wl.fixed_token_counts)
+                        | {c for c in cand_counts if c < int(wl.max_tokens)}
+                    )
+                )
+                return replace(
+                    wl,
+                    token_counts=new_counts,
+                    fixed_token_counts=new_fixed,
+                )
+            return wl
+
+        b12x_prep_mod._module_workload = _patched_module_workload
+    except Exception:
+        pass
+    print(
+        f"[spark-glm53] Phase 2 & Phase 3 GPU worker patches installed in pid={os.getpid()}",
+        flush=True,
+    )
+
+
 def install_all_spark_glm53_patches() -> None:
     """
     Idempotent entry point registered via `vllm.general_plugins` and invoked in
     every vLLM process (API server, EngineCore, and Rank 0 / Rank 1 WorkerProcs).
+    Defer heavy B12X/Cutlass/GPUModelRunner imports until `WorkerWrapperBase.init_worker`
+    so `APIServer` and `EngineCore` save ~1.0 GiB of private host RAM on Head.
     """
     global _PATCHES_INSTALLED
     if _PATCHES_INSTALLED:
@@ -2440,22 +2829,41 @@ def install_all_spark_glm53_patches() -> None:
 
     configure_spark_env()
     _verify_nccl_version()
-
-    # Phase 2: Persistent /dev/shm zero-copy weight loader & page-cache protection
-    from worker.shm_safetensors import install_shm_patches
-
-    install_shm_patches()
-
-    # Phase 3: sm_121a B12X + DFlash2 + SuffixCopyDrafter + L2 Prefetch + Workspace patches
-    _patch_l2_prefetch_and_indexer_workspace()
-    _patch_dflash_attn_sm121a()
-    _patch_dflash_kv_cache_and_block_size()
-    _patch_dflash2_context_cudagraph_and_copy_drafter()
     _patch_scheduler_and_boundary_checkpoints()
-    _patch_sparse_mla_kpool_indexer()
+
+    in_init_worker = False
+    try:
+        frame: Any = sys._getframe()
+        while frame is not None:
+            if frame.f_code.co_name == "init_worker":
+                in_init_worker = True
+                break
+            frame = frame.f_back
+    except Exception:
+        pass
+
+    if in_init_worker or os.getenv("SPARK_FORCE_ALL_PATCHES", "0") == "1":
+        install_gpu_worker_patches()
+    else:
+        try:
+            from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+            if not getattr(WorkerWrapperBase, "_spark_patched_init_worker", False):
+                orig_init_worker = WorkerWrapperBase.init_worker
+
+                def _patched_init_worker(
+                    self: WorkerWrapperBase, *args: Any, **kwargs: Any
+                ) -> Any:
+                    install_gpu_worker_patches()
+                    return orig_init_worker(self, *args, **kwargs)
+
+                WorkerWrapperBase.init_worker = _patched_init_worker
+                WorkerWrapperBase._spark_patched_init_worker = True
+        except Exception:
+            install_gpu_worker_patches()
 
     print(
-        f"[spark-glm53] Phase 2 & Phase 3 patches installed in pid={os.getpid()} "
+        f"[spark-glm53] Lightweight control-plane patches installed in pid={os.getpid()} "
         f"(VLLM_HOST_IP={os.environ.get('VLLM_HOST_IP')})",
         flush=True,
     )
@@ -2463,7 +2871,7 @@ def install_all_spark_glm53_patches() -> None:
 
 def main() -> None:
     """CLI entrypoint wrapping `vllm serve` with Spark-GLM53 Phase 3 defaults."""
-    install_all_spark_glm53_patches()
+    configure_spark_env()
     from vllm.entrypoints.cli.main import main as vllm_main
 
     sys.exit(vllm_main())

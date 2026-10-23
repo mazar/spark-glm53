@@ -10,6 +10,4 @@ export NCCL_BUFFSIZE=1048576
 export NCCL_MAX_CTAS=8
 export VLLM_SSM_CONV_STATE_LAYOUT="DS"
 export VLLM_USE_AOT_COMPILE="1"
-export VLLM_GLM53_L2_PREFETCH="0"
-export GLM53_INDEXER_WORKSPACE="rightsize"
-export PATH="/home/massoud/sdk/go1.27.1/bin:/home/massoud/.local/bin:$PATH"
+export PATH="$HOME/sdk/go1.27.1/bin:$HOME/.local/bin:/usr/local/go/bin:$PATH"

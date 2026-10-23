@@ -525,7 +525,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--gateway-url", default="http://127.0.0.1:8888")
     parser.add_argument("--model", default="GLM-5.3-Flash")
-    parser.add_argument("--output-json", default="/home/massoud/spark-glm53/logs/gate4_verification.json")
+    parser.add_argument(
+        "--output-json",
+        default=os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs",
+            "gate4_verification.json",
+        ),
+    )
     args = parser.parse_args()
 
     res = asyncio.run(run_gate4_suite(args.gateway_url, args.model))

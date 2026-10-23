@@ -18,7 +18,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-WORKER_HOST="${WORKER_HOST:-spark-8a27}"
+discover_worker_host() {
+  if [[ -n "${WORKER_HOST:-}" ]]; then
+    echo "$WORKER_HOST"
+    return
+  fi
+  for cand in spark-8a27 10.100.240.2 10.100.241.2; do
+    if [[ "$cand" != "$(hostname)" ]] && ssh -o BatchMode=yes -o ConnectTimeout=2 "$cand" true 2>/dev/null; then
+      echo "$cand"
+      return
+    fi
+  done
+  echo "10.100.240.2"
+}
+WORKER_HOST="$(discover_worker_host)"
 VERIFY=0
 
 for arg in "$@"; do
@@ -129,6 +142,14 @@ tune_node() {
       pkill -x Xorg 2>/dev/null || true
       pkill -x gnome-shell 2>/dev/null || true
     fi
+    # Configure earlyoom with safe thresholds (384 MiB SIGTERM / 192 MiB SIGKILL) and protect agy / weight daemons
+    EARLYOOM_CFG=/host_etc/default/earlyoom
+    [ -f \"\$EARLYOOM_CFG\" ] || EARLYOOM_CFG=/etc/default/earlyoom
+    if [ -f \"\$EARLYOOM_CFG\" ]; then
+      sed -i 's|^EARLYOOM_ARGS=.*|EARLYOOM_ARGS=\"-r 3600 -p -M 393216,196608 -s 100,100 --prefer ^(VLLM\\|pt_main_thread\\|tensorfold) --avoid ^(systemd\\|sshd\\|dockerd\\|containerd\\|dbus-daemon\\|NetworkManager\\|gdm\\|Xorg\\|nvidia\\|agy\\|tmux\\|spark-shm-weigh)\"|' \"\$EARLYOOM_CFG\" 2>/dev/null || true
+    fi
+    nsenter -t 1 -m -u -i -n -p systemctl restart earlyoom 2>/dev/null || true
+    nsenter -t 1 -m -u -i -n -p systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
 
     # 2c. GB10 UMA Page-Cache Hygiene, /dev/shm Sizing & VM Sysctls
     # Ensure /dev/shm has >= 108 GiB capacity and 2MB hugepages (huge=always) for 35+ GiB/s cudaHostRegister
@@ -206,7 +227,7 @@ export NCCL_BUFFSIZE=1048576
 export NCCL_MAX_CTAS=8
 export VLLM_SSM_CONV_STATE_LAYOUT="DS"
 export VLLM_USE_AOT_COMPILE="1"
-export PATH="/home/massoud/sdk/go1.27.1/bin:/home/massoud/.local/bin:\$PATH"
+export PATH="\$HOME/sdk/go1.27.1/bin:\$HOME/.local/bin:/usr/local/go/bin:\$PATH"
 EOF
 
 # Source into current process as well

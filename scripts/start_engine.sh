@@ -4,20 +4,57 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKER_HOST="${WORKER_HOST:-spark-8a27}"
+HOST_HOME="${HOST_HOME:-$HOME}"
+HOST_CACHE_DIR="${HOST_CACHE_DIR:-$HOST_HOME/.cache}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-vllm-node-b12x:latest}"
+if ! docker image inspect "$DOCKER_IMAGE" >/dev/null 2>&1; then
+  if docker image inspect "eugr/spark-vllm-b12x:latest" >/dev/null 2>&1; then
+    DOCKER_IMAGE="eugr/spark-vllm-b12x:latest"
+  fi
+fi
+
+# Auto-discover peer DGX Spark worker if WORKER_HOST is not explicitly set
+discover_worker_host() {
+  if [[ -n "${WORKER_HOST:-}" ]]; then
+    echo "$WORKER_HOST"
+    return
+  fi
+  for cand in spark-8a27 10.100.240.2 10.100.241.2; do
+    if [[ "$cand" != "$(hostname)" ]] && ssh -o BatchMode=yes -o ConnectTimeout=2 "$cand" true 2>/dev/null; then
+      echo "$cand"
+      return
+    fi
+  done
+  echo "10.100.240.2"
+}
+WORKER_HOST="$(discover_worker_host)"
 HEAD_ROCE_IP="${HEAD_ROCE_IP:-10.100.240.1}"
 WORKER_ROCE_IP="${WORKER_ROCE_IP:-10.100.240.2}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 ENGINE_PORT="${ENGINE_PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.900}"
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-16800000000}"
-MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-2048}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.850}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-16400000000}"
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-4096}"
 SPEC_ENABLED="${SPEC_ENABLED:-1}"
 
-TARGET_SNAPSHOT="/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-Spark/snapshots/a608241037e4c2565356bff7ca293f2133888f88"
-HOST_TARGET_SNAPSHOT="/home/massoud/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-Spark/snapshots/a608241037e4c2565356bff7ca293f2133888f88"
-DFLASH_SNAPSHOT="/root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a"
+# Dynamically resolve HuggingFace snapshot paths on host and inside container (/root/.cache/huggingface)
+resolve_snapshot() {
+  local repo_dir="$1"
+  local base="$HOST_CACHE_DIR/huggingface/hub/$repo_dir/snapshots"
+  if [[ -d "$base" ]]; then
+    ls -1dt "$base"/* 2>/dev/null | head -n 1 || true
+  fi
+}
+
+HOST_TARGET_SNAPSHOT="${HOST_TARGET_SNAPSHOT:-$(resolve_snapshot 'models--local-inference-lab--GLM-5.3-Flash-NVFP4-Spark')}"
+if [[ -z "$HOST_TARGET_SNAPSHOT" || ! -d "$HOST_TARGET_SNAPSHOT" ]]; then
+  HOST_TARGET_SNAPSHOT="${HOST_TARGET_SNAPSHOT:-$(resolve_snapshot 'models--nvidia--GLM-5.3-Flash-FP4-Local')}"
+fi
+HOST_DFLASH_SNAPSHOT="${HOST_DFLASH_SNAPSHOT:-$(resolve_snapshot 'models--incoai--GLM-5.3-Flash-DFlash2')}"
+
+TARGET_SNAPSHOT="${TARGET_SNAPSHOT:-${HOST_TARGET_SNAPSHOT/#$HOST_CACHE_DIR/\/root\/.cache}}"
+DFLASH_SNAPSHOT="${DFLASH_SNAPSHOT:-${HOST_DFLASH_SNAPSHOT/#$HOST_CACHE_DIR/\/root\/.cache}}"
 
 log() { printf '[start_engine] %s\n' "$*"; }
 
@@ -26,29 +63,41 @@ log() { printf '[start_engine] %s\n' "$*"; }
 
 # 1b. Reclaim headless display / desktop GPU contexts, disable host swap via nsenter, and flush OS file page cache on both nodes
 log "Reclaiming headless GPU contexts, locking GPU clocks (3003 MHz), disabling host swap, and flushing file page cache..."
-docker run --rm --privileged --gpus all --pid=host --ipc=host -v /proc:/host_proc -v /home/massoud/.cache:/host_cache vllm-node-b12x:latest sh -c '
+docker run --rm --privileged --gpus all --pid=host --ipc=host -v /proc:/host_proc -v "$HOST_CACHE_DIR:/host_cache" "$DOCKER_IMAGE" sh -c '
   nvidia-smi -pm 1 >/dev/null 2>&1 || true
   nvidia-smi -lgc 3003,3003 >/dev/null 2>&1 || true
   chown -R 1000:1000 /host_cache/b12x /host_cache/vllm /host_cache/vllm-glm53-flash 2>/dev/null || true
-  rm -f /dev/shm/psm_* /dev/shm/sem.mp-* /dev/shm/glm53_dflash2.safetensors 2>/dev/null || true
-  nsenter -t 1 -m -u -i -n -p systemctl stop gdm gdm3 lightdm display-manager 2>/dev/null || true
+  rm -f /dev/shm/psm_* /dev/shm/sem.mp-* 2>/dev/null || true
+  nsenter -t 1 -m -u -i -n -p systemctl stop gdm gdm3 lightdm display-manager apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
+  if [ -f /etc/default/earlyoom ] || nsenter -t 1 -m -- test -f /etc/default/earlyoom 2>/dev/null; then
+    nsenter -t 1 -m -- sed -i "s|^EARLYOOM_ARGS=.*|EARLYOOM_ARGS=\"-r 3600 -p -M 98304,65536 -s 100,100 --prefer ^(VLLM\\|pt_main_thread\\|tensorfold) --avoid ^(systemd\\|sshd\\|dockerd\\|containerd\\|dbus-daemon\\|NetworkManager\\|gdm\\|Xorg\\|nvidia\\|agy\\|tmux\\|spark-shm-weigh)\"|" /etc/default/earlyoom 2>/dev/null || true
+    nsenter -t 1 -m -u -i -n -p systemctl restart earlyoom 2>/dev/null || true
+  fi
   pkill -9 -x chrome 2>/dev/null || true
   pkill -9 -x gnome-shell 2>/dev/null || true
   pkill -9 -x Xorg 2>/dev/null || true
+  pkill -9 -f "_offline_compiler_spawn_environment" 2>/dev/null || true
+  pkill -9 -f "multiprocessing.spawn import spawn_main" 2>/dev/null || true
   nsenter -t 1 -m -u -i -n -p swapoff -a 2>/dev/null || true
   echo 0 > /host_proc/sys/vm/watermark_boost_factor 2>/dev/null || true
   echo 65536 > /host_proc/sys/vm/min_free_kbytes 2>/dev/null || true
   sync && echo 3 > /host_proc/sys/vm/drop_caches 2>/dev/null || true
 ' || true
-ssh -o BatchMode=yes "$WORKER_HOST" "docker run --rm --privileged --gpus all --pid=host --ipc=host -v /proc:/host_proc -v /home/massoud/.cache:/host_cache vllm-node-b12x:latest sh -c '
+ssh -o BatchMode=yes "$WORKER_HOST" "docker run --rm --privileged --gpus all --pid=host --ipc=host -v /proc:/host_proc -v $HOST_CACHE_DIR:/host_cache $DOCKER_IMAGE sh -c '
   nvidia-smi -pm 1 >/dev/null 2>&1 || true
   nvidia-smi -lgc 3003,3003 >/dev/null 2>&1 || true
   chown -R 1000:1000 /host_cache/b12x /host_cache/vllm /host_cache/vllm-glm53-flash 2>/dev/null || true
-  rm -f /dev/shm/psm_* /dev/shm/sem.mp-* /dev/shm/glm53_dflash2.safetensors 2>/dev/null || true
-  nsenter -t 1 -m -u -i -n -p systemctl stop gdm gdm3 lightdm display-manager 2>/dev/null || true
+  rm -f /dev/shm/psm_* /dev/shm/sem.mp-* 2>/dev/null || true
+  nsenter -t 1 -m -u -i -n -p systemctl stop gdm gdm3 lightdm display-manager apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
+  if [ -f /etc/default/earlyoom ] || nsenter -t 1 -m -- test -f /etc/default/earlyoom 2>/dev/null; then
+    nsenter -t 1 -m -- sed -i \"s|^EARLYOOM_ARGS=.*|EARLYOOM_ARGS=\\\"-r 3600 -p -M 98304,65536 -s 100,100 --prefer ^(VLLM\\\\|pt_main_thread\\\\|tensorfold) --avoid ^(systemd\\\\|sshd\\\\|dockerd\\\\|containerd\\\\|dbus-daemon\\\\|NetworkManager\\\\|gdm\\\\|Xorg\\\\|nvidia\\\\|agy\\\\|tmux\\\\|spark-shm-weigh)\\\"|\" /etc/default/earlyoom 2>/dev/null || true
+    nsenter -t 1 -m -u -i -n -p systemctl restart earlyoom 2>/dev/null || true
+  fi
   pkill -9 -x chrome 2>/dev/null || true
   pkill -9 -x gnome-shell 2>/dev/null || true
   pkill -9 -x Xorg 2>/dev/null || true
+  pkill -9 -f \"_offline_compiler_spawn_environment\" 2>/dev/null || true
+  pkill -9 -f \"multiprocessing.spawn import spawn_main\" 2>/dev/null || true
   nsenter -t 1 -m -u -i -n -p swapoff -a 2>/dev/null || true
   echo 0 > /host_proc/sys/vm/watermark_boost_factor 2>/dev/null || true
   echo 65536 > /host_proc/sys/vm/min_free_kbytes 2>/dev/null || true
@@ -58,13 +107,13 @@ ssh -o BatchMode=yes "$WORKER_HOST" "docker run --rm --privileged --gpus all --p
 # 2. Sync worker code, chat template, and plugin metadata to Worker node
 log "Syncing worker codebase, chat template, and b12x compile cache to $WORKER_HOST..."
 cp -f "$ROOT_DIR/worker/glm53_chat_template.jinja" "$HOST_TARGET_SNAPSHOT/chat_template.jinja" || true
-ssh -o BatchMode=yes "$WORKER_HOST" "mkdir -p $ROOT_DIR/worker/kernels $ROOT_DIR/spark_glm53-1.0.0.dist-info $ROOT_DIR/scripts /home/massoud/.cache/b12x/compile/preparation"
+ssh -o BatchMode=yes "$WORKER_HOST" "mkdir -p $ROOT_DIR/worker/kernels $ROOT_DIR/spark_glm53-1.0.0.dist-info $ROOT_DIR/scripts $HOST_CACHE_DIR/b12x/compile/preparation"
 rsync -az --omit-dir-times --exclude='__pycache__' --exclude='*.pyc' "$ROOT_DIR/worker/" "$WORKER_HOST:$ROOT_DIR/worker/"
 rsync -az --omit-dir-times --exclude='__pycache__' --exclude='*.pyc' "$ROOT_DIR/spark_glm53-1.0.0.dist-info/" "$WORKER_HOST:$ROOT_DIR/spark_glm53-1.0.0.dist-info/"
 scp -q "$ROOT_DIR/usercustomize.py" "$ROOT_DIR/scripts/benchmark_suite.py" "$WORKER_HOST:$ROOT_DIR/" || true
 scp -q "$ROOT_DIR/worker/glm53_chat_template.jinja" "$WORKER_HOST:$HOST_TARGET_SNAPSHOT/chat_template.jinja" || true
-if [[ -d /home/massoud/.cache/b12x ]]; then
-  rsync -az --omit-dir-times /home/massoud/.cache/b12x/ "$WORKER_HOST:/home/massoud/.cache/b12x/" || true
+if [[ -d "$HOST_CACHE_DIR/b12x" ]]; then
+  rsync -az --omit-dir-times "$HOST_CACHE_DIR/b12x/" "$WORKER_HOST:$HOST_CACHE_DIR/b12x/" || true
 fi
 
 # 3. Verify persistent /dev/shm and CUDA IPC weight daemons on both nodes
@@ -106,6 +155,10 @@ if os.path.exists(s):
 '" || true
 "$ROOT_DIR/bin/spark-shm-weights" --rank 0 --status || true
 ssh -o BatchMode=yes "$WORKER_HOST" "$ROOT_DIR/bin/spark-shm-weights --rank 1 --status" || true
+if [[ "$SPARK_USE_CUDA_IPC" == "1" ]]; then
+  docker exec spark-shm-weights rm -f /dev/shm/glm53_dflash2.safetensors 2>/dev/null || true
+  ssh -o BatchMode=yes "$WORKER_HOST" "docker exec spark-shm-weights rm -f /dev/shm/glm53_dflash2.safetensors 2>/dev/null || true" || true
+fi
 
 if [[ "$SPARK_USE_CUDA_IPC" == "1" ]]; then
   if ! python3 "$ROOT_DIR/worker/cuda_ipc_daemon.py" --rank 0 --status >/dev/null 2>&1; then
@@ -116,7 +169,7 @@ if [[ "$SPARK_USE_CUDA_IPC" == "1" ]]; then
         --gpus all --ipc=host --network=host --privileged \
         -v /tmp:/tmp -v "$ROOT_DIR:$ROOT_DIR" \
         -e PYTHONPATH="$ROOT_DIR" \
-        --entrypoint python3 vllm-node-b12x:latest \
+        --entrypoint python3 "$DOCKER_IMAGE" \
         "$ROOT_DIR/worker/cuda_ipc_daemon.py" --rank 0 >/dev/null
     else
       rm -f /dev/shm/glm53_rank_0.safetensors /dev/shm/glm53_rank_0.safetensors.cudaipc.json /dev/shm/glm53_rank_0.safetensors.w13_normalized 2>/dev/null || true
@@ -130,7 +183,7 @@ if [[ "$SPARK_USE_CUDA_IPC" == "1" ]]; then
           --gpus all --ipc=host --network=host --privileged \
           -v /tmp:/tmp -v $ROOT_DIR:$ROOT_DIR \
           -e PYTHONPATH=$ROOT_DIR \
-          --entrypoint python3 vllm-node-b12x:latest \
+          --entrypoint python3 $DOCKER_IMAGE \
           $ROOT_DIR/worker/cuda_ipc_daemon.py --rank 1 >/dev/null"
     else
       ssh -o BatchMode=yes "$WORKER_HOST" "rm -f /dev/shm/glm53_rank_1.safetensors /dev/shm/glm53_rank_1.safetensors.cudaipc.json /dev/shm/glm53_rank_1.safetensors.w13_normalized 2>/dev/null || true"
@@ -190,12 +243,12 @@ COMMON_DOCKER_ENV=(
   -e "GLM53_INDEXER_WORKSPACE=rightsize"
   -e "SPARK_SHM_ENABLE=1"
   -e "SPARK_SHM_MATERIALIZE_DENSE=${SPARK_SHM_MATERIALIZE_DENSE:-1}"
-  -e "SPARK_ENABLE_COPY_DRAFT=${SPARK_ENABLE_COPY_DRAFT:-1}"
+  -e "SPARK_ENABLE_COPY_DRAFT=${SPARK_ENABLE_COPY_DRAFT:-0}"
   -e "SPARK_DFLASH_STEPS=${SPARK_DFLASH_STEPS:-7}"
   -e "SPARK_COPY_DRAFT_SPAN=${SPARK_COPY_DRAFT_SPAN:-7}"
   -e "SPARK_PROFILE_STEPS=${SPARK_PROFILE_STEPS:-0}"
   -e "SPARK_LAYER_PROF=${SPARK_LAYER_PROF:-0}"
-  -e "PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.17"
+  -e "PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.145,max_split_size_mb:64"
 )
 
 SPEC_ARGS=()
@@ -215,7 +268,7 @@ COMPILATION_JSON='{"cudagraph_mode":"FULL_AND_PIECEWISE","max_cudagraph_capture_
 
 COMMON_VLLM_ARGS=(
   "$TARGET_SNAPSHOT"
-  --served-model-name GLM-5.3-Flash local-inference-lab/GLM-5.3-Flash-NVFP4-Spark
+  --served-model-name GLM-5.3-Flash
   --chat-template "$ROOT_DIR/worker/glm53_chat_template.jinja"
   --trust-remote-code
   --language-model-only
@@ -238,6 +291,7 @@ COMMON_VLLM_ARGS=(
   --gpu-memory-utilization "$GPU_MEM_UTIL"
   --kv-cache-memory-bytes "$KV_CACHE_MEMORY_BYTES"
   --enable-prefix-caching
+  --no-async-scheduling
   --compilation-config "$COMPILATION_JSON"
   "${SPEC_ARGS[@]}"
   "${EXTRA_VLLM_ARGS[@]}"
@@ -247,21 +301,23 @@ COMMON_VLLM_ARGS=(
 log "Starting Worker Rank 1 container (spark-glm53-worker) on $WORKER_HOST..."
 ssh -o BatchMode=yes "$WORKER_HOST" bash -s <<EOF
 set -euo pipefail
-mkdir -p /home/massoud/.cache/b12x /home/massoud/.cache/flashinfer /home/massoud/.cache/vllm /home/massoud/.cache/vllm-glm53-flash/triton
+mkdir -p $HOST_CACHE_DIR/b12x $HOST_CACHE_DIR/flashinfer $HOST_CACHE_DIR/vllm $HOST_CACHE_DIR/vllm-glm53-flash/triton
 docker run -d --name spark-glm53-worker \
   --gpus all --ipc=host --network=host --privileged \
   --ulimit memlock=-1:-1 \
-  -v /home/massoud/.cache/huggingface:/root/.cache/huggingface \
-  -v /home/massoud/.cache/b12x:/root/.cache/b12x \
-  -v /home/massoud/.cache/flashinfer:/root/.cache/flashinfer \
-  -v /home/massoud/.cache/vllm:/root/.cache/vllm \
-  -v /home/massoud/.cache/vllm-glm53-flash/triton:/root/.triton/cache \
+  -v $HOST_CACHE_DIR/huggingface:/root/.cache/huggingface \
+  -v $HOST_CACHE_DIR/b12x:/root/.cache/b12x \
+  -v $HOST_CACHE_DIR/flashinfer:/root/.cache/flashinfer \
+  -v $HOST_CACHE_DIR/vllm:/root/.cache/vllm \
+  -v $HOST_CACHE_DIR/vllm-glm53-flash/triton:/root/.triton/cache \
   -v /tmp:/tmp \
   -v $ROOT_DIR:$ROOT_DIR \
+  -v $ROOT_DIR/usercustomize.py:/usr/lib/python3.12/sitecustomize.py:ro \
+  -v $ROOT_DIR/usercustomize.py:/usr/local/lib/python3.12/dist-packages/usercustomize.py:ro \
   -e VLLM_HOST_IP=$WORKER_ROCE_IP \
   ${COMMON_DOCKER_ENV[*]} \
   --entrypoint python3 \
-  vllm-node-b12x:latest \
+  $DOCKER_IMAGE \
   $ROOT_DIR/worker/b12x_dflash_runner.py serve \
   $(printf '%q ' "${COMMON_VLLM_ARGS[@]}") \
   --node-rank 1 --headless >/dev/null
@@ -271,21 +327,23 @@ sleep 2
 
 # 5. Start Head Rank 0 container (spark-glm53-head) on port 8000
 log "Starting Head Rank 0 container (spark-glm53-head) on $(hostname) port $ENGINE_PORT..."
-mkdir -p /home/massoud/.cache/b12x /home/massoud/.cache/flashinfer /home/massoud/.cache/vllm /home/massoud/.cache/vllm-glm53-flash/triton
+mkdir -p "$HOST_CACHE_DIR/b12x" "$HOST_CACHE_DIR/flashinfer" "$HOST_CACHE_DIR/vllm" "$HOST_CACHE_DIR/vllm-glm53-flash/triton"
 docker run -d --name spark-glm53-head \
   --gpus all --ipc=host --network=host --privileged \
   --ulimit memlock=-1:-1 \
-  -v /home/massoud/.cache/huggingface:/root/.cache/huggingface \
-  -v /home/massoud/.cache/b12x:/root/.cache/b12x \
-  -v /home/massoud/.cache/flashinfer:/root/.cache/flashinfer \
-  -v /home/massoud/.cache/vllm:/root/.cache/vllm \
-  -v /home/massoud/.cache/vllm-glm53-flash/triton:/root/.triton/cache \
+  -v "$HOST_CACHE_DIR/huggingface:/root/.cache/huggingface" \
+  -v "$HOST_CACHE_DIR/b12x:/root/.cache/b12x" \
+  -v "$HOST_CACHE_DIR/flashinfer:/root/.cache/flashinfer" \
+  -v "$HOST_CACHE_DIR/vllm:/root/.cache/vllm" \
+  -v "$HOST_CACHE_DIR/vllm-glm53-flash/triton:/root/.triton/cache" \
   -v /tmp:/tmp \
   -v "$ROOT_DIR:$ROOT_DIR" \
+  -v "$ROOT_DIR/usercustomize.py:/usr/lib/python3.12/sitecustomize.py:ro" \
+  -v "$ROOT_DIR/usercustomize.py:/usr/local/lib/python3.12/dist-packages/usercustomize.py:ro" \
   -e "VLLM_HOST_IP=$HEAD_ROCE_IP" \
   "${COMMON_DOCKER_ENV[@]}" \
   --entrypoint python3 \
-  vllm-node-b12x:latest \
+  "$DOCKER_IMAGE" \
   "$ROOT_DIR/worker/b12x_dflash_runner.py" serve \
   "${COMMON_VLLM_ARGS[@]}" \
   --node-rank 0 --host 0.0.0.0 --port "$ENGINE_PORT" >/dev/null
@@ -302,11 +360,10 @@ for i in $(seq 1 360); do
       GATEWAY_PORT="${GATEWAY_PORT:-8888}"
       log "Starting Go Control Plane (spark-gateway) on port ${GATEWAY_PORT} -> http://127.0.0.1:${ENGINE_PORT} ..."
       pkill -9 -x spark-gateway 2>/dev/null || true
-      nohup "$ROOT_DIR/bin/spark-gateway" \
+      docker exec -d spark-glm53-head "$ROOT_DIR/bin/spark-gateway" \
         --listen ":${GATEWAY_PORT}" \
         --upstream "http://127.0.0.1:${ENGINE_PORT}" \
-        --spill-dir "/tmp/spark_kv_spill" \
-        > "$ROOT_DIR/logs/spark_gateway.log" 2>&1 &
+        --spill-dir "/tmp/spark_kv_spill"
       sleep 1
       if curl -sf "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null 2>&1; then
         log "Go Control Plane (spark-gateway) is READY on port ${GATEWAY_PORT}!"

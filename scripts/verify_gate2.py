@@ -18,8 +18,10 @@ import os
 import sys
 import time
 
+import glob
+
 sys.path.insert(0, "/workspace")
-sys.path.insert(0, "/home/massoud/spark-glm53")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import safetensors.torch
 import torch
@@ -33,6 +35,11 @@ from worker.shm_safetensors import (
 )
 
 
+def _default_snapshot(repo_pattern: str, fallback: str) -> str:
+    matches = sorted(glob.glob(f"/root/.cache/huggingface/hub/{repo_pattern}/snapshots/*"))
+    return matches[-1] if matches else fallback
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank", type=int, required=True)
@@ -42,12 +49,21 @@ def main() -> None:
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-Spark/snapshots/a608241037e4c2565356bff7ca293f2133888f88",
+        default=_default_snapshot(
+            "models--local-inference-lab--GLM-5.3-Flash-NVFP4-Spark",
+            "/root/.cache/huggingface/hub/models--local-inference-lab--GLM-5.3-Flash-NVFP4-Spark",
+        ),
     )
     parser.add_argument(
         "--dflash-path",
         type=str,
-        default="/root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a/model.safetensors",
+        default=os.path.join(
+            _default_snapshot(
+                "models--incoai--GLM-5.3-Flash-DFlash2",
+                "/root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2",
+            ),
+            "model.safetensors",
+        ),
     )
     parser.add_argument("--run-label", type=str, default="boot")
     args = parser.parse_args()

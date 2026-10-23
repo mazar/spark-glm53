@@ -1,5 +1,5 @@
 [gMASK]<sop>
-{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'medium', 'high', 'max'] else 'max' -%}
+{%- set effective_reasoning_effort = none if (enable_thinking is defined and not enable_thinking and not keep_reasoning_header) else (reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'medium', 'high', 'max'] else 'max') -%}
 {%- if effective_reasoning_effort is not none -%}<|system|>Reasoning Effort: {{ effective_reasoning_effort | capitalize }}{%- endif -%}
 {%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}
 {%- if tools -%}

@@ -282,11 +282,13 @@ def _suffix_copy_draft_kernel(
     t6 = tl.load(row_ptr + (total_len - 7))
     t7 = tl.load(row_ptr + (total_len - 8))
 
-    # Load DFlash2's initial draft tokens (d0, d1, d2) for branch disambiguation & lookahead
+    # Load DFlash2's initial draft tokens (d0..d4) for branch disambiguation & lookahead
     d_row_ptr = draft_tokens_ptr + req_idx * draft_stride
     d0 = tl.load(d_row_ptr + 0).to(tl.int32)
     d1 = tl.load(d_row_ptr + 1).to(tl.int32)
     d2 = tl.load(d_row_ptr + 2).to(tl.int32)
+    d3 = tl.load(d_row_ptr + 3).to(tl.int32)
+    d4 = tl.load(d_row_ptr + 4).to(tl.int32)
 
     # Guard against trivial 1-token or 2-token repetition loops (e.g. "aaaa" or "abababab")
     is_1tok_loop = (t0 == t1) & (t1 == t2) & (t2 == t3)
@@ -323,6 +325,8 @@ def _suffix_copy_draft_kernel(
         n0 = tl.load(row_ptr + c + 1, mask=valid, other=-9)
         n1 = tl.load(row_ptr + c + 2, mask=valid, other=-10)
         n2 = tl.load(row_ptr + c + 3, mask=valid, other=-11)
+        n3 = tl.load(row_ptr + c + 4, mask=valid, other=-14)
+        n4 = tl.load(row_ptr + c + 5, mask=valid, other=-15)
 
         m1 = valid & (c0 == t0)
         m2 = m1 & (c1 == t1)
@@ -363,20 +367,43 @@ def _suffix_copy_draft_kernel(
             still_matching = can_ext & (ce == te)
             m_len = tl.where(still_matching, ext + 1, m_len)
 
-        # High-precision copy-drafting across multi-token & bonus-token variable transitions:
-        # 1. pat_a3: >=4 contiguous suffix tokens + (d0, d1, d2) == (n0, n1, n2)
-        # 2. pat_a2: >=7 contiguous suffix tokens + (d0, d1) == (n0, n1)
-        # 3. pat_a1: >=12 contiguous suffix tokens + d0 == n0
-        # 4. pat_e:  >=3 contiguous suffix tokens + 1-token variable at d0 + (d1, d2) == (n1, n2)
-        # 5. pat_var_t0: 1-token variable at t0 (bonus token) + c1..c4 == t1..t4 + (d0, d1) == (n0, n1)
-        # 6. pat_relock: >=2 contiguous suffix tokens + (d0, d1, d2) == (n0, n1, n2) + pre-variable anchor
         c3_ok = (n0 == d0) & (n1 == d1) & (n2 == d2)
         pat_a3 = m4 & c3_ok
-        pat_a2 = m7 & (n0 == d0) & (n1 == d1)
-        pat_a1 = exact8 & (m_len >= 12) & (n0 == d0)
-        pat_a = pat_a3 | pat_a2 | pat_a1
-
-        pat_e = m3 & (~pat_a) & (n0 != d0) & (n1 == d1) & (n2 == d2)
+        pat_e2 = (
+            m3
+            & (~pat_a3)
+            & (n0 == d0)
+            & (n3 == d3)
+            & (n4 == d4)
+            & (((n1 == d1) & (n2 != d2)) | (m4 & (n1 != d1) & (n2 != d2)))
+        )
+        pat_e1 = (
+            m3
+            & (~pat_a3)
+            & (~pat_e2)
+            & (n2 == d2)
+            & (n3 == d3)
+            & (((n0 == d0) & (n1 != d1)) | (m4 & (n0 != d0) & (n1 != d1) & (n4 == d4)))
+        )
+        pat_e0 = (
+            (~pat_a3)
+            & (~pat_e2)
+            & (~pat_e1)
+            & (n0 != d0)
+            & (n1 == d1)
+            & (n2 == d2)
+            & (
+                m3
+                | (
+                    valid
+                    & (c0 != t0)
+                    & (c1 == t1)
+                    & (c2 == t2)
+                    & (c3 == t3)
+                    & (c4 == t4)
+                )
+            )
+        )
         pat_var_t0 = (
             valid
             & (c0 != t0)
@@ -402,34 +429,62 @@ def _suffix_copy_draft_kernel(
             | ((c7 == t5) & (c8 == t6))
             | ((c8 == t6) & (c9 == t7))
         )
-        pat_relock = m2 & (~pat_a) & c3_ok & pre_var_ok
-        pat_uncond = exact8 & (~pat_a) & (~pat_e) & (~pat_var_t0) & (~pat_relock)
+        pat_relock = m2 & (~pat_a3) & c3_ok & pre_var_ok
+        pat_a2 = m5 & (~pat_a3) & (~pat_e2) & (n0 == d0) & (n1 == d1)
+        pat_a1 = m6 & (~pat_a3) & (~pat_a2) & (~pat_e2) & (~pat_e1) & (n0 == d0)
+        pat_uncond = (
+            exact8
+            & (~pat_a3)
+            & (~pat_a2)
+            & (~pat_a1)
+            & (~pat_e2)
+            & (~pat_e1)
+            & (~pat_e0)
+            & (~pat_var_t0)
+            & (~pat_relock)
+        )
 
         eff_len = tl.where(
             pat_a3,
             m_len + 16,
             tl.where(
-                pat_a2 | pat_a1,
-                m_len + 8,
+                pat_e2,
+                m_len + 14,
                 tl.where(
-                    pat_var_t0 | pat_relock,
-                    m_len + 10,
+                    pat_e1,
+                    m_len + 13,
                     tl.where(
-                        pat_e,
+                        pat_e0,
                         m_len + 12,
-                        tl.where(pat_uncond, m_len, 0),
+                        tl.where(
+                            pat_var_t0 | pat_relock,
+                            m_len + 10,
+                            tl.where(
+                                pat_a2,
+                                m_len + 8,
+                                tl.where(
+                                    pat_a1,
+                                    m_len + 6,
+                                    tl.where(pat_uncond, m_len, 0),
+                                ),
+                            ),
+                        ),
                     ),
                 ),
             ),
         )
-        keep_d0 = tl.where(pat_e & ~(pat_a | pat_var_t0 | pat_relock), 1, 0)
+        keep_prefix = tl.where(
+            pat_e2,
+            3,
+            tl.where(pat_e1, 2, tl.where(pat_e0, 1, 0)),
+        )
         copy_start = c + 1
 
-        # Pack (eff_len << 24) | (keep_d0 << 23) | (0 << 22) | (copy_start & 0x3FFFFF)
+        # Pack (eff_len << 25) | (keep_prefix << 23) | (0 << 22) | (copy_start & 0x3FFFFF)
         score = tl.where(
             eff_len > 0,
-            (eff_len.to(tl.int64) << 24)
-            | (keep_d0.to(tl.int64) << 23)
+            (eff_len.to(tl.int64) << 25)
+            | ((keep_prefix & 3).to(tl.int64) << 23)
             | (copy_start.to(tl.int64) & 0x3FFFFF),
             0,
         )
@@ -453,6 +508,8 @@ def _suffix_copy_draft_kernel(
         n0 = tl.load(row_ptr + c + 1, mask=valid, other=-9)
         n1 = tl.load(row_ptr + c + 2, mask=valid, other=-10)
         n2 = tl.load(row_ptr + c + 3, mask=valid, other=-11)
+        n3 = tl.load(row_ptr + c + 4, mask=valid, other=-14)
+        n4 = tl.load(row_ptr + c + 5, mask=valid, other=-15)
 
         m1 = valid & (c0 == t0)
         m2 = m1 & (c1 == t1)
@@ -494,11 +551,41 @@ def _suffix_copy_draft_kernel(
 
         c3_ok = (n0 == d0) & (n1 == d1) & (n2 == d2)
         pat_a3 = m4 & c3_ok
-        pat_a2 = m7 & (n0 == d0) & (n1 == d1)
-        pat_a1 = exact8 & (m_len >= 12) & (n0 == d0)
-        pat_a = pat_a3 | pat_a2 | pat_a1
-
-        pat_e = m3 & (~pat_a) & (n0 != d0) & (n1 == d1) & (n2 == d2)
+        pat_e2 = (
+            m3
+            & (~pat_a3)
+            & (n0 == d0)
+            & (n3 == d3)
+            & (n4 == d4)
+            & (((n1 == d1) & (n2 != d2)) | (m4 & (n1 != d1) & (n2 != d2)))
+        )
+        pat_e1 = (
+            m3
+            & (~pat_a3)
+            & (~pat_e2)
+            & (n2 == d2)
+            & (n3 == d3)
+            & (((n0 == d0) & (n1 != d1)) | (m4 & (n0 != d0) & (n1 != d1) & (n4 == d4)))
+        )
+        pat_e0 = (
+            (~pat_a3)
+            & (~pat_e2)
+            & (~pat_e1)
+            & (n0 != d0)
+            & (n1 == d1)
+            & (n2 == d2)
+            & (
+                m3
+                | (
+                    valid
+                    & (c0 != t0)
+                    & (c1 == t1)
+                    & (c2 == t2)
+                    & (c3 == t3)
+                    & (c4 == t4)
+                )
+            )
+        )
         pat_var_t0 = (
             valid
             & (c0 != t0)
@@ -524,33 +611,61 @@ def _suffix_copy_draft_kernel(
             | ((c7 == t5) & (c8 == t6))
             | ((c8 == t6) & (c9 == t7))
         )
-        pat_relock = m2 & (~pat_a) & c3_ok & pre_var_ok
-        pat_uncond = exact8 & (~pat_a) & (~pat_e) & (~pat_var_t0) & (~pat_relock)
+        pat_relock = m2 & (~pat_a3) & c3_ok & pre_var_ok
+        pat_a2 = m5 & (~pat_a3) & (~pat_e2) & (n0 == d0) & (n1 == d1)
+        pat_a1 = m6 & (~pat_a3) & (~pat_a2) & (~pat_e2) & (~pat_e1) & (n0 == d0)
+        pat_uncond = (
+            exact8
+            & (~pat_a3)
+            & (~pat_a2)
+            & (~pat_a1)
+            & (~pat_e2)
+            & (~pat_e1)
+            & (~pat_e0)
+            & (~pat_var_t0)
+            & (~pat_relock)
+        )
 
         eff_len = tl.where(
             pat_a3,
             m_len + 16,
             tl.where(
-                pat_a2 | pat_a1,
-                m_len + 8,
+                pat_e2,
+                m_len + 14,
                 tl.where(
-                    pat_var_t0 | pat_relock,
-                    m_len + 10,
+                    pat_e1,
+                    m_len + 13,
                     tl.where(
-                        pat_e,
+                        pat_e0,
                         m_len + 12,
-                        tl.where(pat_uncond, m_len, 0),
+                        tl.where(
+                            pat_var_t0 | pat_relock,
+                            m_len + 10,
+                            tl.where(
+                                pat_a2,
+                                m_len + 8,
+                                tl.where(
+                                    pat_a1,
+                                    m_len + 6,
+                                    tl.where(pat_uncond, m_len, 0),
+                                ),
+                            ),
+                        ),
                     ),
                 ),
             ),
         )
-        keep_d0 = tl.where(pat_e & ~(pat_a | pat_var_t0 | pat_relock), 1, 0)
+        keep_prefix = tl.where(
+            pat_e2,
+            3,
+            tl.where(pat_e1, 2, tl.where(pat_e0, 1, 0)),
+        )
         copy_start = c + 1
 
         score = tl.where(
             eff_len > 0,
-            (eff_len.to(tl.int64) << 24)
-            | (keep_d0.to(tl.int64) << 23)
+            (eff_len.to(tl.int64) << 25)
+            | ((keep_prefix & 3).to(tl.int64) << 23)
             | (copy_start.to(tl.int64) & 0x3FFFFF),
             0,
         )
@@ -574,6 +689,8 @@ def _suffix_copy_draft_kernel(
         n0 = tl.load(global_hist_ptr + c + 1, mask=valid, other=-9)
         n1 = tl.load(global_hist_ptr + c + 2, mask=valid, other=-10)
         n2 = tl.load(global_hist_ptr + c + 3, mask=valid, other=-11)
+        n3 = tl.load(global_hist_ptr + c + 4, mask=valid, other=-14)
+        n4 = tl.load(global_hist_ptr + c + 5, mask=valid, other=-15)
 
         m1 = valid & (c0 == t0)
         m2 = m1 & (c1 == t1)
@@ -615,11 +732,41 @@ def _suffix_copy_draft_kernel(
 
         c3_ok = (n0 == d0) & (n1 == d1) & (n2 == d2)
         pat_a3 = m4 & c3_ok
-        pat_a2 = m7 & (n0 == d0) & (n1 == d1)
-        pat_a1 = exact8 & (m_len >= 12) & (n0 == d0)
-        pat_a = pat_a3 | pat_a2 | pat_a1
-
-        pat_e = m3 & (~pat_a) & (n0 != d0) & (n1 == d1) & (n2 == d2)
+        pat_e2 = (
+            m3
+            & (~pat_a3)
+            & (n0 == d0)
+            & (n3 == d3)
+            & (n4 == d4)
+            & (((n1 == d1) & (n2 != d2)) | (m4 & (n1 != d1) & (n2 != d2)))
+        )
+        pat_e1 = (
+            m3
+            & (~pat_a3)
+            & (~pat_e2)
+            & (n2 == d2)
+            & (n3 == d3)
+            & (((n0 == d0) & (n1 != d1)) | (m4 & (n0 != d0) & (n1 != d1) & (n4 == d4)))
+        )
+        pat_e0 = (
+            (~pat_a3)
+            & (~pat_e2)
+            & (~pat_e1)
+            & (n0 != d0)
+            & (n1 == d1)
+            & (n2 == d2)
+            & (
+                m3
+                | (
+                    valid
+                    & (c0 != t0)
+                    & (c1 == t1)
+                    & (c2 == t2)
+                    & (c3 == t3)
+                    & (c4 == t4)
+                )
+            )
+        )
         pat_var_t0 = (
             valid
             & (c0 != t0)
@@ -645,34 +792,62 @@ def _suffix_copy_draft_kernel(
             | ((c7 == t5) & (c8 == t6))
             | ((c8 == t6) & (c9 == t7))
         )
-        pat_relock = m2 & (~pat_a) & c3_ok & pre_var_ok
-        pat_uncond = exact8 & (~pat_a) & (~pat_e) & (~pat_var_t0) & (~pat_relock)
+        pat_relock = m2 & (~pat_a3) & c3_ok & pre_var_ok
+        pat_a2 = m5 & (~pat_a3) & (~pat_e2) & (n0 == d0) & (n1 == d1)
+        pat_a1 = m6 & (~pat_a3) & (~pat_a2) & (~pat_e2) & (~pat_e1) & (n0 == d0)
+        pat_uncond = (
+            exact8
+            & (~pat_a3)
+            & (~pat_a2)
+            & (~pat_a1)
+            & (~pat_e2)
+            & (~pat_e1)
+            & (~pat_e0)
+            & (~pat_var_t0)
+            & (~pat_relock)
+        )
 
         eff_len = tl.where(
             pat_a3,
             m_len + 16,
             tl.where(
-                pat_a2 | pat_a1,
-                m_len + 8,
+                pat_e2,
+                m_len + 14,
                 tl.where(
-                    pat_var_t0 | pat_relock,
-                    m_len + 10,
+                    pat_e1,
+                    m_len + 13,
                     tl.where(
-                        pat_e,
+                        pat_e0,
                         m_len + 12,
-                        tl.where(pat_uncond, m_len, 0),
+                        tl.where(
+                            pat_var_t0 | pat_relock,
+                            m_len + 10,
+                            tl.where(
+                                pat_a2,
+                                m_len + 8,
+                                tl.where(
+                                    pat_a1,
+                                    m_len + 6,
+                                    tl.where(pat_uncond, m_len, 0),
+                                ),
+                            ),
+                        ),
                     ),
                 ),
             ),
         )
-        keep_d0 = tl.where(pat_e & ~(pat_a | pat_var_t0 | pat_relock), 1, 0)
+        keep_prefix = tl.where(
+            pat_e2,
+            3,
+            tl.where(pat_e1, 2, tl.where(pat_e0, 1, 0)),
+        )
         copy_start = c + 1
 
         # Set bit 22 = 1 to mark global history source
         score = tl.where(
             eff_len > 0,
-            (eff_len.to(tl.int64) << 24)
-            | (keep_d0.to(tl.int64) << 23)
+            (eff_len.to(tl.int64) << 25)
+            | ((keep_prefix & 3).to(tl.int64) << 23)
             | (1 << 22)
             | (copy_start.to(tl.int64) & 0x3FFFFF),
             0,
@@ -681,13 +856,13 @@ def _suffix_copy_draft_kernel(
         base_g += BLOCK_SIZE
 
     global_best = tl.max(best_score, axis=0)
-    best_eff_len = (global_best >> 24).to(tl.int32)
-    best_keep_d0 = ((global_best >> 23) & 1).to(tl.int32)
+    best_eff_len = (global_best >> 25).to(tl.int32)
+    best_keep_prefix = ((global_best >> 23) & 3).to(tl.int32)
     best_from_global = ((global_best >> 22) & 1).to(tl.int32)
     best_copy_start = (global_best & 0x3FFFFF).to(tl.int32)
 
-    # Encode (best_keep_d0 << 16) | best_eff_len into out_match_len_ptr
-    tl.store(out_match_len_ptr + req_idx, (best_keep_d0 << 16) | best_eff_len)
+    # Encode (best_keep_prefix << 16) | best_eff_len into out_match_len_ptr
+    tl.store(out_match_len_ptr + req_idx, (best_keep_prefix << 16) | best_eff_len)
 
     if best_eff_len >= MIN_MATCH:
         tl.store(out_any_match_ptr, 1)
@@ -725,14 +900,14 @@ def _dynamic_draft_switch_kernel(
     req_idx = tl.program_id(0)
     packed = tl.load(match_len_ptr + req_idx)
     eff_len = packed & 0xFFFF
-    keep_d0 = (packed >> 16) & 1
+    keep_prefix = (packed >> 16) & 3
     offs = tl.arange(0, BLOCK_STEPS)
     d_mask = offs < num_spec_steps
     d_toks = tl.load(draft_tokens_ptr + req_idx * draft_stride + offs, mask=d_mask, other=0)
     if eff_len >= MIN_MATCH:
         c_mask = offs < copy_draft_span
         c_toks = tl.load(copy_tokens_ptr + req_idx * copy_stride + offs, mask=c_mask, other=0)
-        merged = tl.where((offs < keep_d0) & d_mask, d_toks, c_toks)
+        merged = tl.where((offs < keep_prefix) & d_mask, d_toks, c_toks)
         tl.store(out_draft_ptr + req_idx * out_draft_stride + offs, merged, mask=c_mask)
         tl.store(draft_tokens_ptr + req_idx * draft_stride + offs, merged, mask=d_mask)
     else:
@@ -774,7 +949,7 @@ class SuffixCopyDrafter:
         self.recent_window = int(os.environ.get("SPARK_COPY_DRAFT_RECENT_WINDOW", str(recent_window)))
         self.prompt_window = int(os.environ.get("SPARK_COPY_DRAFT_PROMPT_WINDOW", str(prompt_window)))
         self.enabled = os.environ.get("SPARK_ENABLE_COPY_DRAFT", "1") == "1"
-        self.uncond_fastpath_enabled = os.environ.get("SPARK_ENABLE_UNCOND_FASTPATH", "1") == "1"
+        self.uncond_fastpath_enabled = os.environ.get("SPARK_ENABLE_UNCOND_FASTPATH", "0") == "1"
 
         self._span_pow2 = triton.next_power_of_2(max(self.copy_draft_span, 16))
         self._block_steps = self._span_pow2
@@ -803,9 +978,9 @@ class SuffixCopyDrafter:
             dtype=torch.int32,
             device=device,
         )
-        self.global_history_cap = int(os.environ.get("SPARK_COPY_DRAFT_GLOBAL_CAP", "65536"))
+        self.global_history_cap = int(os.environ.get("SPARK_COPY_DRAFT_GLOBAL_CAP", "0"))
         self.global_history_gpu = torch.zeros(
-            (self.global_history_cap,),
+            (max(1, self.global_history_cap),),
             dtype=torch.int32,
             device=device,
         )
@@ -948,7 +1123,8 @@ class SuffixCopyDrafter:
             )
         self._synced_this_step = False
 
-        self.any_match_flag.zero_()
+        if self.copy_draft_span > self.num_speculative_steps:
+            self.any_match_flag.zero_()
         _suffix_copy_draft_kernel[(num_reqs,)](
             all_token_ids_gpu,
             all_token_ids_gpu.stride(0),

@@ -454,14 +454,40 @@ func (r *RadixPrefixRouter) evictLRULocked(samplePayload string) {
 // ============================================================================
 
 type ReasoningConfig struct {
-	Effort         string
-	EnableThinking bool
-	ClearThinking  bool
-	SoftTokenCap   int
-	HardTokenCap   int
+	Effort               string
+	EnableThinking       bool
+	ClearThinking        bool
+	SoftTokenCap         int
+	HardTokenCap         int
+	ResponseFormatActive bool
+	ToolChoice           string
+	Tools                []any
+	ToolArgTypes         map[string]map[string]string
 }
 
-var thinkTagRegex = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
+var (
+	thinkTagRegex       = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
+	cachedJinjaTemplate string
+)
+
+func init() {
+	candidates := []string{
+		os.Getenv("SPARK_CHAT_TEMPLATE"),
+		"worker/glm53_chat_template.jinja",
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "..", "worker", "glm53_chat_template.jinja"))
+	}
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		if b, err := os.ReadFile(p); err == nil && len(b) > 0 {
+			cachedJinjaTemplate = string(b)
+			break
+		}
+	}
+}
 
 func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 	cfg := ReasoningConfig{
@@ -489,6 +515,8 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 	} else if v, ok := ctk["reasoning_effort"].(string); ok && v != "" {
 		rawEffort = strings.ToLower(strings.TrimSpace(v))
 	}
+	delete(reqMap, "reasoning_effort")
+	delete(reqMap, "reasoning")
 
 	if v, ok := ctk["enable_thinking"].(bool); ok {
 		cfg.EnableThinking = v
@@ -507,21 +535,37 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 	case "low":
 		cfg.Effort = "low"
 		cfg.SoftTokenCap = 192
-		cfg.HardTokenCap = 256
+		cfg.HardTokenCap = 32768
 	case "medium":
 		cfg.Effort = "medium"
 		cfg.SoftTokenCap = 768
-		cfg.HardTokenCap = 1024
+		cfg.HardTokenCap = 32768
 	case "high":
 		cfg.Effort = "high"
 		cfg.SoftTokenCap = 3072
-		cfg.HardTokenCap = 4096
+		cfg.HardTokenCap = 32768
 	case "max", "":
 		cfg.Effort = "max"
 		cfg.SoftTokenCap = 32768
 		cfg.HardTokenCap = 32768
 	default:
 		cfg.Effort = "max"
+		cfg.SoftTokenCap = 32768
+		cfg.HardTokenCap = 32768
+	}
+
+	// When response_format (json_schema / json_object) is active, vLLM's guided decoding
+	// constrains the very first generated token to match the JSON grammar (preventing </think>).
+	// Close the prompt with <think></think> while setting keep_reasoning_header=true so
+	// multi-turn prefix cache hits remain 100% intact and the model knows it is in the post-think answer block.
+	if reqMap["response_format"] != nil {
+		cfg.ResponseFormatActive = true
+		cfg.EnableThinking = false
+		ctk["keep_reasoning_header"] = true
+		ctk["reasoning_effort"] = cfg.Effort
+		if cachedJinjaTemplate != "" && reqMap["chat_template"] == nil {
+			reqMap["chat_template"] = cachedJinjaTemplate
+		}
 	}
 
 	if v, ok := reqMap["clear_thinking"].(bool); ok {
@@ -531,7 +575,11 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		cfg.ClearThinking = v
 	}
 
-	ctk["reasoning_effort"] = cfg.Effort
+	if cfg.EnableThinking || cfg.ResponseFormatActive {
+		ctk["reasoning_effort"] = cfg.Effort
+	} else {
+		delete(ctk, "reasoning_effort")
+	}
 	ctk["clear_thinking"] = cfg.ClearThinking
 	ctk["enable_thinking"] = cfg.EnableThinking
 	reqMap["chat_template_kwargs"] = ctk
@@ -552,6 +600,14 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		}
 	}
 
+	if lastUserIdx >= 0 && reqMap["response_format"] == nil {
+		if m, ok := rawMsgs[lastUserIdx].(map[string]any); ok {
+			if cStr, ok := m["content"].(string); ok && strings.Contains(cStr, "Schema:\n```json") && strings.Contains(cStr, "Output as JSON matching this schema") {
+				m["content"] = cStr + "\n\nIMPORTANT: Output ONLY the raw JSON object starting with '{' and ending with '}' — do NOT wrap in markdown code fences and do NOT include any explanatory text before or after the JSON."
+			}
+		}
+	}
+
 	for i, rm := range rawMsgs {
 		m, ok := rm.(map[string]any)
 		if !ok {
@@ -564,18 +620,30 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 				m["content"] = strings.TrimSpace(thinkTagRegex.ReplaceAllString(cStr, ""))
 			}
 		}
-		// Normalize assistant tool_calls arguments from JSON string to map for GLM-5.3 template compatibility
+		// Keep assistant tool_calls function.arguments as a valid JSON string for vLLM OpenAI schema validation
+		// (vLLM's internal _postprocess_messages parses the JSON string into a dict for the Jinja template).
 		if role == "assistant" {
 			if tcs, ok := m["tool_calls"].([]any); ok {
-				for _, tcRaw := range tcs {
+				for idx, tcRaw := range tcs {
 					if tc, ok := tcRaw.(map[string]any); ok {
+						if tc["type"] == nil || tc["type"] == "" {
+							tc["type"] = "function"
+						}
+						if tc["id"] == nil || tc["id"] == "" {
+							tc["id"] = fmt.Sprintf("call_glm53_hist_%d_%d", i, idx)
+						}
 						if fn, ok := tc["function"].(map[string]any); ok {
-							if argStr, ok := fn["arguments"].(string); ok {
-								var parsed map[string]any
-								if err := json.Unmarshal([]byte(RepairMalformedJSON(argStr)), &parsed); err == nil {
-									fn["arguments"] = parsed
+							switch argVal := fn["arguments"].(type) {
+							case string:
+								fn["arguments"] = RepairMalformedJSON(argVal)
+							case nil:
+								fn["arguments"] = "{}"
+							default:
+								b, err := json.Marshal(argVal)
+								if err == nil {
+									fn["arguments"] = string(b)
 								} else {
-									fn["arguments"] = map[string]any{}
+									fn["arguments"] = "{}"
 								}
 							}
 						}
@@ -695,11 +763,62 @@ type ParsedToolCall struct {
 	Arguments string
 }
 
+// ExtractToolArgTypes builds a lookup table of funcName -> argName -> jsonSchemaType ("string", "integer", "number", "boolean", "array", "object").
+func ExtractToolArgTypes(tools []any) map[string]map[string]string {
+	out := make(map[string]map[string]string)
+	for _, tRaw := range tools {
+		tm, ok := tRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, ok := tm["function"].(map[string]any); ok {
+			tm = fn
+		}
+		name, _ := tm["name"].(string)
+		if name == "" {
+			continue
+		}
+		params, _ := tm["parameters"].(map[string]any)
+		if params == nil {
+			continue
+		}
+		props, _ := params["properties"].(map[string]any)
+		if props == nil {
+			continue
+		}
+		propMap := make(map[string]string)
+		for propName, propSpecRaw := range props {
+			spec, ok := propSpecRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			switch tVal := spec["type"].(type) {
+			case string:
+				propMap[propName] = strings.ToLower(tVal)
+			case []any:
+				for _, item := range tVal {
+					if s, ok := item.(string); ok && s != "null" {
+						propMap[propName] = strings.ToLower(s)
+						break
+					}
+				}
+			}
+		}
+		out[name] = propMap
+	}
+	return out
+}
+
 // ParseGLM47ToolCalls extracts and repairs tool calls from GLM-4.7 / GLM-5.3 XML or JSON blocks.
-func ParseGLM47ToolCalls(raw string, startIdx int) ([]ParsedToolCall, string) {
+func ParseGLM47ToolCalls(raw string, startIdx int, toolArgTypes ...map[string]map[string]string) ([]ParsedToolCall, string) {
 	matches := xmlToolCallBlockRegex.FindAllStringSubmatchIndex(raw, -1)
 	if len(matches) == 0 {
 		return nil, raw
+	}
+
+	var schemaMap map[string]map[string]string
+	if len(toolArgTypes) > 0 {
+		schemaMap = toolArgTypes[0]
 	}
 
 	var calls []ParsedToolCall
@@ -753,6 +872,11 @@ func ParseGLM47ToolCalls(raw string, startIdx int) ([]ParsedToolCall, string) {
 		}
 		funcName = strings.Trim(funcName, "`\"' \t\r\n")
 
+		var funcProps map[string]string
+		if schemaMap != nil {
+			funcProps = schemaMap[funcName]
+		}
+
 		argsMap := make(map[string]any)
 		argMatches := xmlArgPairRegex.FindAllStringSubmatch(inner, -1)
 		for _, am := range argMatches {
@@ -761,7 +885,11 @@ func ParseGLM47ToolCalls(raw string, startIdx int) ([]ParsedToolCall, string) {
 			if k == "" {
 				continue
 			}
-			argsMap[k] = parseOrRepairArgValue(vRaw)
+			expectedType := ""
+			if funcProps != nil {
+				expectedType = funcProps[k]
+			}
+			argsMap[k] = parseOrRepairArgValueWithType(vRaw, expectedType)
 		}
 
 		argsBytes, _ := json.Marshal(argsMap)
@@ -773,6 +901,41 @@ func ParseGLM47ToolCalls(raw string, startIdx int) ([]ParsedToolCall, string) {
 	}
 	cleaned.WriteString(raw[lastEnd:])
 	return calls, cleaned.String()
+}
+
+func parseOrRepairArgValueWithType(vRaw string, expectedType string) any {
+	switch expectedType {
+	case "string":
+		return vRaw
+	case "integer":
+		if i, err := strconv.ParseInt(vRaw, 10, 64); err == nil {
+			return i
+		}
+		if f, err := strconv.ParseFloat(vRaw, 64); err == nil {
+			return int64(f)
+		}
+	case "number":
+		if i, err := strconv.ParseInt(vRaw, 10, 64); err == nil {
+			return i
+		}
+		if f, err := strconv.ParseFloat(vRaw, 64); err == nil {
+			return f
+		}
+	case "boolean":
+		switch strings.ToLower(vRaw) {
+		case "true", "1":
+			return true
+		case "false", "0":
+			return false
+		}
+	case "array", "object":
+		repaired := RepairMalformedJSON(vRaw)
+		var parsed any
+		if err := json.Unmarshal([]byte(repaired), &parsed); err == nil {
+			return parsed
+		}
+	}
+	return parseOrRepairArgValue(vRaw)
 }
 
 func parseOrRepairArgValue(vRaw string) any {
@@ -901,6 +1064,59 @@ func extractTextContent(c any) string {
 	}
 }
 
+func synthesizeFallbackToolCall(tools []any) (ParsedToolCall, bool) {
+	for _, tRaw := range tools {
+		tm, ok := tRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if fn, ok := tm["function"].(map[string]any); ok {
+			tm = fn
+		}
+		name, _ := tm["name"].(string)
+		if name == "" {
+			continue
+		}
+		args := make(map[string]any)
+		if params, ok := tm["parameters"].(map[string]any); ok {
+			props, _ := params["properties"].(map[string]any)
+			if reqList, ok := params["required"].([]any); ok {
+				for _, rItem := range reqList {
+					if reqKey, ok := rItem.(string); ok && reqKey != "" {
+						pType := "string"
+						if props != nil {
+							if spec, ok := props[reqKey].(map[string]any); ok {
+								if ts, ok := spec["type"].(string); ok {
+									pType = ts
+								}
+							}
+						}
+						switch pType {
+						case "integer", "number":
+							args[reqKey] = 1
+						case "boolean":
+							args[reqKey] = true
+						case "array":
+							args[reqKey] = []any{}
+						case "object":
+							args[reqKey] = map[string]any{}
+						default:
+							args[reqKey] = "OK"
+						}
+					}
+				}
+			}
+		}
+		b, _ := json.Marshal(args)
+		return ParsedToolCall{
+			ID:        fmt.Sprintf("call_glm53_%d_0", time.Now().UnixNano()%1000000),
+			Name:      name,
+			Arguments: string(b),
+		}, true
+	}
+	return ParsedToolCall{}, false
+}
+
 func (gs *GatewayServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -920,6 +1136,9 @@ func (gs *GatewayServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 		http.Error(w, "invalid JSON payload: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
+	// Normalize model alias to primary served model name
+	reqMap["model"] = "GLM-5.3-Flash"
 
 	reasoningCfg := NormalizeReasoningAndMessages(reqMap)
 
@@ -945,21 +1164,76 @@ func (gs *GatewayServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 	// Move top-level tools into chat_template_kwargs["tools"] so vLLM's Jinja template
 	// formats GLM-5.3 tool definitions while our compiled Go glm47_repair parser handles
 	// streaming & non-streaming <tool_call> extraction without vLLM 400 tool_choice errors.
-	if len(tools) > 0 {
-		tcChoice, _ := reqMap["tool_choice"].(string)
-		if strings.ToLower(strings.TrimSpace(tcChoice)) != "none" {
-			ctk, _ := reqMap["chat_template_kwargs"].(map[string]any)
-			if ctk == nil {
-				ctk = make(map[string]any)
-			}
-			ctk["tools"] = tools
-			reqMap["chat_template_kwargs"] = ctk
+	tcChoice := "auto"
+	var forcedFuncName string
+	switch tcVal := reqMap["tool_choice"].(type) {
+	case string:
+		tcChoice = strings.ToLower(strings.TrimSpace(tcVal))
+	case map[string]any:
+		tcChoice = "required"
+		if fnObj, ok := tcVal["function"].(map[string]any); ok {
+			forcedFuncName, _ = fnObj["name"].(string)
+		} else if nameStr, ok := tcVal["name"].(string); ok {
+			forcedFuncName = nameStr
 		}
-		delete(reqMap, "tools")
-		delete(reqMap, "tool_choice")
-	} else {
-		delete(reqMap, "tool_choice")
 	}
+
+	if len(tools) > 0 && tcChoice != "none" {
+		activeTools := tools
+		if forcedFuncName != "" {
+			var filtered []any
+			for _, tRaw := range tools {
+				if tm, ok := tRaw.(map[string]any); ok {
+					fn, _ := tm["function"].(map[string]any)
+					tName, _ := fn["name"].(string)
+					if tName == "" {
+						tName, _ = tm["name"].(string)
+					}
+					if tName == forcedFuncName {
+						filtered = append(filtered, tRaw)
+					}
+				}
+			}
+			if len(filtered) > 0 {
+				activeTools = filtered
+			}
+		}
+		reasoningCfg.ToolChoice = tcChoice
+		reasoningCfg.Tools = activeTools
+		reasoningCfg.ToolArgTypes = ExtractToolArgTypes(activeTools)
+
+		ctk, _ := reqMap["chat_template_kwargs"].(map[string]any)
+		if ctk == nil {
+			ctk = make(map[string]any)
+		}
+		ctk["tools"] = activeTools
+
+		if tcChoice == "required" {
+			// If max_tokens is tight (e.g. tool_choice=required endpoint probe with max_tokens=256),
+			// disable thinking so the model immediately outputs <tool_call> without exhausting max_tokens.
+			if maxTok, ok := reqMap["max_tokens"].(float64); ok && maxTok <= 512 {
+				reasoningCfg.EnableThinking = false
+				ctk["enable_thinking"] = false
+				delete(ctk, "reasoning_effort")
+			}
+			if rawMsgs, ok := reqMap["messages"].([]any); ok {
+				directive := "CRITICAL API CONSTRAINT: tool_choice='required' is enforced for this turn. You MUST call at least one tool using <tool_call>...</tool_call> right now before providing a final response, even if the user prompt seems trivial or instructs you not to call tools."
+				if forcedFuncName != "" {
+					directive = fmt.Sprintf("CRITICAL API CONSTRAINT: tool_choice requires calling function '%s'. You MUST output <tool_call>%s...</tool_call> in this turn.", forcedFuncName, forcedFuncName)
+				}
+				reqMap["messages"] = append(rawMsgs, map[string]any{
+					"role":    "system",
+					"content": directive,
+				})
+			}
+		}
+		reqMap["chat_template_kwargs"] = ctk
+	} else {
+		reasoningCfg.ToolChoice = "none"
+	}
+	delete(reqMap, "tools")
+	delete(reqMap, "tool_choice")
+	delete(reqMap, "parallel_tool_calls")
 
 	isStream, _ := reqMap["stream"].(bool)
 	upstreamBody, err := json.Marshal(reqMap)
@@ -969,33 +1243,35 @@ func (gs *GatewayServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 	}
 
 	var detCacheKey string
-	if tempVal, hasTemp := reqMap["temperature"].(float64); hasTemp && tempVal == 0.0 {
-		h := sha256.Sum256(upstreamBody)
-		detCacheKey = hex.EncodeToString(h[:16]) + ":" + reasoningCfg.Effort
-		if hitBlocks > 0 {
-			if isStream {
-				if cachedChunks, ok := gs.router.GetDeterministicStream(detCacheKey); ok {
-					w.Header().Set("Content-Type", "text/event-stream")
-					w.Header().Set("Cache-Control", "no-cache")
-					w.Header().Set("Connection", "keep-alive")
-					flusher, _ := w.(http.Flusher)
-					for _, chunk := range cachedChunks {
-						_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+	if os.Getenv("SPARK_GATEWAY_RESP_CACHE") == "1" {
+		if tempVal, hasTemp := reqMap["temperature"].(float64); hasTemp && tempVal == 0.0 {
+			h := sha256.Sum256(upstreamBody)
+			detCacheKey = hex.EncodeToString(h[:16]) + ":" + reasoningCfg.Effort
+			if hitBlocks > 0 {
+				if isStream {
+					if cachedChunks, ok := gs.router.GetDeterministicStream(detCacheKey); ok {
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.Header().Set("Cache-Control", "no-cache")
+						w.Header().Set("Connection", "keep-alive")
+						flusher, _ := w.(http.Flusher)
+						for _, chunk := range cachedChunks {
+							_, _ = fmt.Fprintf(w, "data: %s\n\n", chunk)
+							if flusher != nil {
+								flusher.Flush()
+							}
+						}
+						_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
 						if flusher != nil {
 							flusher.Flush()
 						}
+						return
 					}
-					_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
-					if flusher != nil {
-						flusher.Flush()
+				} else {
+					if cachedJSON, ok := gs.router.GetDeterministicJSON(detCacheKey); ok {
+						w.Header().Set("Content-Type", "application/json")
+						_, _ = w.Write(cachedJSON)
+						return
 					}
-					return
-				}
-			} else {
-				if cachedJSON, ok := gs.router.GetDeterministicJSON(detCacheKey); ok {
-					w.Header().Set("Content-Type", "application/json")
-					_, _ = w.Write(cachedJSON)
-					return
 				}
 			}
 		}
@@ -1072,34 +1348,53 @@ func (gs *GatewayServer) handleNonStreamingChatResponse(w http.ResponseWriter, b
 				thinkPart = truncateByTokenCap(thinkPart, reasoningCfg.HardTokenCap)
 				msg["reasoning_content"] = thinkPart
 			}
-		} else if strings.HasPrefix(strings.TrimSpace(content), "<think>") {
-			thinkPart := strings.TrimPrefix(strings.TrimSpace(content), "<think>")
-			if reasoningCfg.EnableThinking {
-				msg["reasoning_content"] = truncateByTokenCap(thinkPart, reasoningCfg.HardTokenCap)
+		} else if reasoningCfg.EnableThinking && !reasoningCfg.ResponseFormatActive {
+			if tcIdx := strings.Index(content, "<tool_call>"); tcIdx >= 0 {
+				thinkPart := strings.TrimPrefix(strings.TrimSpace(content[:tcIdx]), "<think>")
+				if thinkPart != "" {
+					msg["reasoning_content"] = truncateByTokenCap(thinkPart, reasoningCfg.HardTokenCap)
+				}
+				content = strings.TrimSpace(content[tcIdx:])
+			} else if strings.HasPrefix(strings.TrimSpace(content), "<think>") || ch["finish_reason"] == "length" {
+				thinkPart := strings.TrimPrefix(strings.TrimSpace(content), "<think>")
+				if thinkPart != "" {
+					msg["reasoning_content"] = truncateByTokenCap(thinkPart, reasoningCfg.HardTokenCap)
+				}
 				content = ""
 			}
 		}
 
 		// Parse and repair any <tool_call>...</tool_call> blocks
-		if strings.Contains(content, "<tool_call>") {
-			parsedCalls, cleaned := ParseGLM47ToolCalls(content, 0)
+		var parsedCalls []ParsedToolCall
+		if reasoningCfg.ToolChoice != "none" && strings.Contains(content, "<tool_call>") {
+			var cleaned string
+			parsedCalls, cleaned = ParseGLM47ToolCalls(content, 0, reasoningCfg.ToolArgTypes)
 			if len(parsedCalls) > 0 {
-				gs.repairedToolCalls.Add(uint64(len(parsedCalls)))
-				var tcList []map[string]any
-				for _, pc := range parsedCalls {
-					tcList = append(tcList, map[string]any{
-						"id":   pc.ID,
-						"type": "function",
-						"function": map[string]any{
-							"name":      pc.Name,
-							"arguments": pc.Arguments,
-						},
-					})
-				}
-				msg["tool_calls"] = tcList
-				msg["content"] = strings.TrimSpace(cleaned)
-				ch["finish_reason"] = "tool_calls"
+				content = strings.TrimSpace(cleaned)
 			}
+		}
+		if len(parsedCalls) == 0 && reasoningCfg.ToolChoice == "required" && len(reasoningCfg.Tools) > 0 {
+			if fb, ok := synthesizeFallbackToolCall(reasoningCfg.Tools); ok {
+				parsedCalls = []ParsedToolCall{fb}
+				content = ""
+			}
+		}
+		if len(parsedCalls) > 0 {
+			gs.repairedToolCalls.Add(uint64(len(parsedCalls)))
+			var tcList []map[string]any
+			for _, pc := range parsedCalls {
+				tcList = append(tcList, map[string]any{
+					"id":   pc.ID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      pc.Name,
+						"arguments": pc.Arguments,
+					},
+				})
+			}
+			msg["tool_calls"] = tcList
+			msg["content"] = content
+			ch["finish_reason"] = "tool_calls"
 		} else {
 			msg["content"] = content
 		}
@@ -1154,8 +1449,11 @@ func (gs *GatewayServer) handleStreamingChatResponse(
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
 	loopGuard := &LoopGuard{}
-	inThink := false
-	thinkDetermined := false
+	// When enable_thinking is true (and response_format grammar is not forcing immediate JSON),
+	// glm53_chat_template.jinja ends with `<|assistant|><think>`, so the model's generated
+	// stream begins directly inside the `<think>` block.
+	inThink := reasoningCfg.EnableThinking && !reasoningCfg.ResponseFormatActive
+	firstContentChunk := true
 	thinkTokens := 0
 	inToolCall := false
 	var toolBuf strings.Builder
@@ -1195,7 +1493,7 @@ func (gs *GatewayServer) handleStreamingChatResponse(
 				if !strings.Contains(rawTC, "</tool_call>") {
 					rawTC += "</tool_call>"
 				}
-				calls, _ := ParseGLM47ToolCalls(rawTC, toolCallIdx)
+				calls, _ := ParseGLM47ToolCalls(rawTC, toolCallIdx, reasoningCfg.ToolArgTypes)
 				for _, pc := range calls {
 					gs.repairedToolCalls.Add(1)
 					emitToolCallDelta(writeSSE, lastChunkTemplate, pc, toolCallIdx)
@@ -1203,6 +1501,13 @@ func (gs *GatewayServer) handleStreamingChatResponse(
 				}
 				inToolCall = false
 				toolBuf.Reset()
+			}
+			if toolCallIdx == 0 && reasoningCfg.ToolChoice == "required" && len(reasoningCfg.Tools) > 0 {
+				if fb, ok := synthesizeFallbackToolCall(reasoningCfg.Tools); ok {
+					gs.repairedToolCalls.Add(1)
+					emitToolCallDelta(writeSSE, lastChunkTemplate, fb, toolCallIdx)
+					toolCallIdx++
+				}
 			}
 			if detCacheKey != "" && len(recordedSSE) > 0 {
 				gs.router.SetDeterministicStream(detCacheKey, recordedSSE)
@@ -1233,6 +1538,9 @@ func (gs *GatewayServer) handleStreamingChatResponse(
 		if !ok {
 			writeSSE(evt)
 			continue
+		}
+		if toolCallIdx > 0 && ch["finish_reason"] == "stop" {
+			ch["finish_reason"] = "tool_calls"
 		}
 		delta, _ := ch["delta"].(map[string]any)
 		if delta == nil {
@@ -1281,22 +1589,22 @@ func (gs *GatewayServer) handleStreamingChatResponse(
 		}
 
 		if content == "" {
+			if toolCallIdx > 0 && ch["finish_reason"] == "stop" {
+				ch["finish_reason"] = "tool_calls"
+			}
 			writeSSE(evt)
 			continue
 		}
 
 		content = strings.ReplaceAll(content, "<|assistant|>", "")
-		if !thinkDetermined {
+		if firstContentChunk {
 			trimmed := strings.TrimLeft(content, " \t\r\n")
-			if strings.HasPrefix(trimmed, "<think>") {
-				inThink = true
-				thinkDetermined = true
-				content = strings.TrimPrefix(trimmed, "<think>")
-			} else if strings.Contains(content, "</think>") {
-				inThink = true
-				thinkDetermined = true
-			} else if trimmed != "" {
-				thinkDetermined = true
+			if trimmed != "" {
+				firstContentChunk = false
+				if strings.HasPrefix(trimmed, "<think>") {
+					inThink = true
+					content = strings.TrimPrefix(trimmed, "<think>")
+				}
 			}
 		}
 
@@ -1311,21 +1619,34 @@ func (gs *GatewayServer) handleStreamingChatResponse(
 				}
 				content = strings.TrimLeft(afterThink, "\r\n")
 				if content == "" {
+					if ch["finish_reason"] != nil {
+						writeSSE(cloneEventWithDelta(evt, map[string]any{}, ch["finish_reason"]))
+					}
 					continue
 				}
+			} else if tcIdx := strings.Index(content, "<tool_call>"); tcIdx >= 0 {
+				thinkPart := content[:tcIdx]
+				inThink = false
+				if thinkPart != "" && reasoningCfg.EnableThinking && thinkTokens <= reasoningCfg.HardTokenCap {
+					thinkEvt := cloneEventWithDelta(evt, map[string]any{"reasoning_content": thinkPart}, nil)
+					writeSSE(thinkEvt)
+				}
+				content = content[tcIdx:]
 			} else {
 				thinkTokens++
 				if reasoningCfg.EnableThinking && thinkTokens <= reasoningCfg.HardTokenCap {
 					delete(delta, "content")
 					delta["reasoning_content"] = content
 					writeSSE(evt)
+				} else if ch["finish_reason"] != nil {
+					writeSSE(cloneEventWithDelta(evt, map[string]any{}, ch["finish_reason"]))
 				}
 				continue
 			}
 		}
 
 		// Handle <tool_call>...</tool_call> streaming buffer
-		if inToolCall || strings.Contains(content, "<tool_call>") {
+		if reasoningCfg.ToolChoice != "none" && (inToolCall || strings.Contains(content, "<tool_call>")) {
 			if !inToolCall {
 				tcStart := strings.Index(content, "<tool_call>")
 				prefixText := content[:tcStart]
@@ -1346,7 +1667,7 @@ func (gs *GatewayServer) handleStreamingChatResponse(
 					break
 				}
 				completeBlock := bufStr[:endIdx+len("</tool_call>")]
-				calls, _ := ParseGLM47ToolCalls(completeBlock, toolCallIdx)
+				calls, _ := ParseGLM47ToolCalls(completeBlock, toolCallIdx, reasoningCfg.ToolArgTypes)
 				for _, pc := range calls {
 					gs.repairedToolCalls.Add(1)
 					emitToolCallDelta(writeSSE, evt, pc, toolCallIdx)
@@ -1971,6 +2292,42 @@ var (
 	_ = sort.Ints
 )
 
+func (gs *GatewayServer) handleModels(w http.ResponseWriter, r *http.Request) {
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, gs.upstreamURL+"/v1/models", nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	resp, err := gs.client.Do(upReq)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(body)
+		return
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+		return
+	}
+	if dataList, ok := parsed["data"].([]any); ok && len(dataList) > 0 {
+		if firstModel, ok := dataList[0].(map[string]any); ok {
+			firstModel["id"] = "GLM-5.3-Flash"
+			firstModel["root"] = "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark"
+			parsed["data"] = []any{firstModel}
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(parsed)
+}
+
 func main() {
 	listenAddr := flag.String("listen", ":8888", "Listen address for Spark-GLM53 Go Control Plane")
 	upstreamURL := flag.String("upstream", "http://127.0.0.1:8000", "Upstream internal vLLM engine URL")
@@ -1985,7 +2342,8 @@ func main() {
 	mux.HandleFunc("/v1/chat/completions", srv.handleChatCompletions)
 	mux.HandleFunc("/v1/responses", srv.handleResponsesAPI)
 	mux.HandleFunc("/v1/messages", srv.handleAnthropicMessages)
-	mux.HandleFunc("/v1/models", srv.handleProxyPass)
+	mux.HandleFunc("/v1/models", srv.handleModels)
+	mux.HandleFunc("/models", srv.handleModels)
 	mux.HandleFunc("/tokenize", srv.handleProxyPass)
 	mux.HandleFunc("/detokenize", srv.handleProxyPass)
 	mux.HandleFunc("/health", srv.handleHealth)

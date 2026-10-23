@@ -3,7 +3,20 @@
 # Preserves persistent /dev/shm/glm53_rank_* segments unless --purge-shm is passed.
 set -euo pipefail
 
-WORKER_HOST="${WORKER_HOST:-spark-8a27}"
+discover_worker_host() {
+  if [[ -n "${WORKER_HOST:-}" ]]; then
+    echo "$WORKER_HOST"
+    return
+  fi
+  for cand in spark-8a27 10.100.240.2 10.100.241.2; do
+    if [[ "$cand" != "$(hostname)" ]] && ssh -o BatchMode=yes -o ConnectTimeout=2 "$cand" true 2>/dev/null; then
+      echo "$cand"
+      return
+    fi
+  done
+  echo "10.100.240.2"
+}
+WORKER_HOST="$(discover_worker_host)"
 PURGE_SHM=0
 for arg in "$@"; do
   case "$arg" in

@@ -382,14 +382,13 @@ func findDFlash2Safetensors(explicitPath string) string {
 		}
 	}
 	home, _ := os.UserHomeDir()
-	candidates := []string{
-		filepath.Join(home, ".cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a/model.safetensors"),
-		"/root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a/model.safetensors",
-		"/home/massoud/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a/model.safetensors",
+	patterns := []string{
+		filepath.Join(home, ".cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/*/model.safetensors"),
+		"/root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/*/model.safetensors",
 	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
+	for _, pat := range patterns {
+		if matches, err := filepath.Glob(pat); err == nil && len(matches) > 0 {
+			return matches[0]
 		}
 	}
 	return ""
