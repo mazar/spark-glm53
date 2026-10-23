@@ -397,7 +397,7 @@ for i in $(seq 1 360); do
       pkill -9 -x spark-gateway 2>/dev/null || true
       nohup "$ROOT_DIR/bin/spark-gateway" \
         --listen ":${GATEWAY_PORT}" \
-        --backend "http://127.0.0.1:${ENGINE_PORT}" \
+        --upstream "http://127.0.0.1:${ENGINE_PORT}" \
         --spill-dir "/tmp/spark_kv_spill" > /tmp/spark_gateway.log 2>&1 &
       sleep 1
       if curl -sf "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null 2>&1; then

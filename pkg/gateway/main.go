@@ -2331,9 +2331,13 @@ func (gs *GatewayServer) handleModels(w http.ResponseWriter, r *http.Request) {
 func main() {
 	listenAddr := flag.String("listen", ":8888", "Listen address for Spark-GLM53 Go Control Plane")
 	upstreamURL := flag.String("upstream", "http://127.0.0.1:8000", "Upstream internal vLLM engine URL")
+	backendURL := flag.String("backend", "", "Alias for -upstream")
 	spillDir := flag.String("spill-dir", "/tmp/spark_kv_spill", "Directory for O_DIRECT NVMe KV Spill Tier")
 	blockSize := flag.Int("block-size", DefaultBlockSizeTokens, "KV cache block size in tokens (must match B12X 256)")
 	flag.Parse()
+	if *backendURL != "" {
+		*upstreamURL = *backendURL
+	}
 
 	router := NewRadixPrefixRouter(*blockSize, MaxRadixBlocks, *spillDir)
 	srv := NewGatewayServer(*upstreamURL, router)
