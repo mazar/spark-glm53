@@ -651,13 +651,20 @@ def export_and_rebind_model_to_shm(model: nn.Module, shm_path: str, rank: int = 
         export_sec,
     )
 
-    notify_shmdaemon_lock(shm_path, rank=rank)
+    if os.getenv("SPARK_USE_CUDA_IPC", "1") != "1":
+        notify_shmdaemon_lock(shm_path, rank=rank)
     drop_file_page_cache()
 
     # Now map the newly written /dev/shm file with cudaHostRegister and rebind model tensors
     entry = register_and_map_shm_safetensors(shm_path, device_index=device_index)
     _ensure_shm_moe_w13_normalized(shm_path, entry["tensors"])
-    _bind_shm_views_to_model(model, entry["tensors"], torch.device(f"cuda:{device_index}"), is_cold_rebind=True)
+    _bind_shm_views_to_model(
+        model,
+        entry["tensors"],
+        torch.device(f"cuda:{device_index}"),
+        is_cold_rebind=True,
+        is_cuda_ipc=bool(entry.get("is_cuda_ipc", False)),
+    )
 
 
 def _bind_shm_views_to_model(
@@ -693,7 +700,11 @@ def _bind_shm_views_to_model(
                     if isinstance(sv, torch.Tensor):
                         obj_attr_aliases.setdefault(id(sv), []).append((v, sk))
 
-    materialize_dense = (not is_cuda_ipc) and (os.getenv("SPARK_SHM_MATERIALIZE_DENSE", "1") == "1")
+    materialize_dense = (
+        (not is_cuda_ipc)
+        and (not is_cold_rebind)
+        and (os.getenv("SPARK_SHM_MATERIALIZE_DENSE", "0") == "1")
+    )
     for full_name, view_tensor in views_dict.items():
         if "." in full_name:
             mod_name, attr_name = full_name.rsplit(".", 1)
