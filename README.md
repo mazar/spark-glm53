@@ -190,6 +190,7 @@ To also tear down the persistent weight daemons and free `/dev/shm`:
 spark-glm53/
 ├── LICENSE                         # Apache 2.0 License
 ├── README.md                       # Quick Start, Architecture & Benchmark Comparison
+├── CHANGELOG.md                    # Chronological log of releases, fixes, PRs & benchmarks
 ├── BENCHMARKS.md                   # Detailed Gate 1–4 & tool-eval-bench Engineering Logs
 ├── stop.sh                         # Clean cluster teardown (preserves /dev/shm weights by default)
 ├── scripts/
