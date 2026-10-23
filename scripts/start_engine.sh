@@ -363,6 +363,10 @@ sleep 2
 # 5. Start Head Rank 0 container (spark-glm53-head) on port 8000
 log "Starting Head Rank 0 container (spark-glm53-head) on $(hostname) port $ENGINE_PORT..."
 mkdir -p "$HOST_CACHE_DIR/b12x" "$HOST_CACHE_DIR/flashinfer" "$HOST_CACHE_DIR/vllm" "$HOST_CACHE_DIR/vllm-glm53-flash/triton"
+CLAUDE_VOL_ARGS=()
+if [[ -d "$HOST_HOME/.claude" ]]; then
+  CLAUDE_VOL_ARGS=(-v "$HOST_HOME/.claude:/root/.claude:ro" -v "$HOST_HOME/.claude:$HOST_HOME/.claude:ro")
+fi
 docker run -d --name spark-glm53-head \
   --gpus all --ipc=host --network=host --privileged \
   --ulimit memlock=-1:-1 \
@@ -373,6 +377,7 @@ docker run -d --name spark-glm53-head \
   -v "$HOST_CACHE_DIR/vllm-glm53-flash/triton:/root/.triton/cache" \
   -v /tmp:/tmp \
   -v "$ROOT_DIR:$ROOT_DIR" \
+  "${CLAUDE_VOL_ARGS[@]}" \
   -v "$ROOT_DIR/usercustomize.py:/usr/lib/python3.12/sitecustomize.py:ro" \
   -v "$ROOT_DIR/usercustomize.py:/usr/local/lib/python3.12/dist-packages/usercustomize.py:ro" \
   -e "VLLM_HOST_IP=$HEAD_ROCE_IP" \
@@ -394,6 +399,7 @@ for i in $(seq 1 360); do
     if [[ -x "$ROOT_DIR/bin/spark-gateway" ]]; then
       GATEWAY_PORT="${GATEWAY_PORT:-8888}"
       log "Starting Go Control Plane (spark-gateway) on port ${GATEWAY_PORT} -> http://127.0.0.1:${ENGINE_PORT} ..."
+      docker exec spark-glm53-head sh -c 'for p in /proc/[0-9]*/comm; do [ "$(cat $p 2>/dev/null)" = "spark-gateway" ] && kill -9 $(echo $p | cut -d/ -f3); done' 2>/dev/null || true
       pkill -9 -x spark-gateway 2>/dev/null || true
       docker exec -d spark-glm53-head "$ROOT_DIR/bin/spark-gateway" \
         --listen ":${GATEWAY_PORT}" \
