@@ -72,7 +72,7 @@ Evaluated head-to-head on the exact same 2x NVIDIA DGX Spark cluster using [`too
 All scripts auto-discover your `$HOME` directory, HuggingFace snapshot hashes, and peer DGX Spark worker node (`WORKER_HOST`). You can also override any setting via environment variables.
 
 ### 1. Clone the Repository & Build the Go Binaries
-Run on the **Head Node**:
+Run on the **Head Node** (`./scripts/start_engine.sh` will automatically sync the repository and binaries to the Worker node):
 ```bash
 git clone https://github.com/mazar/spark-glm53.git
 cd spark-glm53
@@ -81,10 +81,6 @@ cd spark-glm53
 mkdir -p bin
 go build -o bin/spark-gateway ./pkg/gateway
 go build -o bin/spark-shm-weights ./pkg/shmdaemon
-
-# Copy the repository to the same path on the Worker node
-export WORKER_HOST="${WORKER_HOST:-<your-worker-hostname-or-ip>}"
-rsync -az --exclude='.git' --exclude='logs' --exclude='runs' ./ "$WORKER_HOST:$(pwd)/"
 ```
 
 ### 2. Download Checkpoints (If Not Already Cached)

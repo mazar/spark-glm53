@@ -58,6 +58,16 @@ DFLASH_SNAPSHOT="${DFLASH_SNAPSHOT:-${HOST_DFLASH_SNAPSHOT/#$HOST_CACHE_DIR/\/ro
 
 log() { printf '[start_engine] %s\n' "$*"; }
 
+# 0. Auto-build Go binaries (spark-gateway and spark-shm-weights) if missing
+if [[ ! -x "$ROOT_DIR/bin/spark-gateway" || ! -x "$ROOT_DIR/bin/spark-shm-weights" ]]; then
+  if command -v go >/dev/null 2>&1; then
+    log "Building Go binaries (bin/spark-gateway, bin/spark-shm-weights)..."
+    mkdir -p "$ROOT_DIR/bin"
+    go build -o "$ROOT_DIR/bin/spark-gateway" "$ROOT_DIR/pkg/gateway"
+    go build -o "$ROOT_DIR/bin/spark-shm-weights" "$ROOT_DIR/pkg/shmdaemon"
+  fi
+fi
+
 # 1. Clean any prior engine containers (preserving spark-shm-weights)
 "$ROOT_DIR/stop.sh"
 
@@ -107,9 +117,12 @@ ssh -o BatchMode=yes "$WORKER_HOST" "docker run --rm --privileged --gpus all --p
 # 2. Sync worker code, chat template, and plugin metadata to Worker node
 log "Syncing worker codebase, chat template, and b12x compile cache to $WORKER_HOST..."
 cp -f "$ROOT_DIR/worker/glm53_chat_template.jinja" "$HOST_TARGET_SNAPSHOT/chat_template.jinja" || true
-ssh -o BatchMode=yes "$WORKER_HOST" "mkdir -p $ROOT_DIR/worker/kernels $ROOT_DIR/spark_glm53-1.0.0.dist-info $ROOT_DIR/scripts $HOST_CACHE_DIR/b12x/compile/preparation"
+ssh -o BatchMode=yes "$WORKER_HOST" "mkdir -p $ROOT_DIR/worker/kernels $ROOT_DIR/spark_glm53-1.0.0.dist-info $ROOT_DIR/scripts $ROOT_DIR/bin $HOST_CACHE_DIR/b12x/compile/preparation"
 rsync -az --omit-dir-times --exclude='__pycache__' --exclude='*.pyc' "$ROOT_DIR/worker/" "$WORKER_HOST:$ROOT_DIR/worker/"
 rsync -az --omit-dir-times --exclude='__pycache__' --exclude='*.pyc' "$ROOT_DIR/spark_glm53-1.0.0.dist-info/" "$WORKER_HOST:$ROOT_DIR/spark_glm53-1.0.0.dist-info/"
+if [[ -d "$ROOT_DIR/bin" ]]; then
+  rsync -az --omit-dir-times "$ROOT_DIR/bin/" "$WORKER_HOST:$ROOT_DIR/bin/" || true
+fi
 scp -q "$ROOT_DIR/usercustomize.py" "$ROOT_DIR/scripts/benchmark_suite.py" "$WORKER_HOST:$ROOT_DIR/" || true
 scp -q "$ROOT_DIR/worker/glm53_chat_template.jinja" "$WORKER_HOST:$HOST_TARGET_SNAPSHOT/chat_template.jinja" || true
 if [[ -d "$HOST_CACHE_DIR/b12x" ]]; then
@@ -119,6 +132,28 @@ fi
 # 3. Verify persistent /dev/shm and CUDA IPC weight daemons on both nodes
 SPARK_USE_CUDA_IPC="${SPARK_USE_CUDA_IPC:-1}"
 log "Verifying persistent weight daemons on Head and Worker (SPARK_USE_CUDA_IPC=${SPARK_USE_CUDA_IPC})..."
+if [[ -x "$ROOT_DIR/bin/spark-shm-weights" ]]; then
+  if ! "$ROOT_DIR/bin/spark-shm-weights" --rank 0 --status >/dev/null 2>&1; then
+    docker rm -f spark-shm-weights >/dev/null 2>&1 || true
+    docker run -d --name spark-shm-weights --restart unless-stopped \
+      --ipc=host --privileged --ulimit memlock=-1:-1 \
+      -v /tmp:/tmp -v "$HOST_HOME:$HOST_HOME" \
+      -v "$HOST_CACHE_DIR/huggingface:/root/.cache/huggingface" \
+      --entrypoint "$ROOT_DIR/bin/spark-shm-weights" \
+      "$DOCKER_IMAGE" --rank 0 >/dev/null 2>&1 || true
+  fi
+  ssh -o BatchMode=yes "$WORKER_HOST" "
+    if ! $ROOT_DIR/bin/spark-shm-weights --rank 1 --status >/dev/null 2>&1; then
+      docker rm -f spark-shm-weights >/dev/null 2>&1 || true
+      docker run -d --name spark-shm-weights --restart unless-stopped \
+        --ipc=host --privileged --ulimit memlock=-1:-1 \
+        -v /tmp:/tmp -v $HOST_HOME:$HOST_HOME \
+        -v $HOST_CACHE_DIR/huggingface:/root/.cache/huggingface \
+        --entrypoint $ROOT_DIR/bin/spark-shm-weights \
+        $DOCKER_IMAGE --rank 1 >/dev/null 2>&1 || true
+    fi
+  " || true
+fi
 python3 -c '
 import os, socket
 s = "/tmp/spark_shm_weights_rank_0.sock"
@@ -360,10 +395,10 @@ for i in $(seq 1 360); do
       GATEWAY_PORT="${GATEWAY_PORT:-8888}"
       log "Starting Go Control Plane (spark-gateway) on port ${GATEWAY_PORT} -> http://127.0.0.1:${ENGINE_PORT} ..."
       pkill -9 -x spark-gateway 2>/dev/null || true
-      docker exec -d spark-glm53-head "$ROOT_DIR/bin/spark-gateway" \
+      nohup "$ROOT_DIR/bin/spark-gateway" \
         --listen ":${GATEWAY_PORT}" \
-        --upstream "http://127.0.0.1:${ENGINE_PORT}" \
-        --spill-dir "/tmp/spark_kv_spill"
+        --backend "http://127.0.0.1:${ENGINE_PORT}" \
+        --spill-dir "/tmp/spark_kv_spill" > /tmp/spark_gateway.log 2>&1 &
       sleep 1
       if curl -sf "http://127.0.0.1:${GATEWAY_PORT}/health" >/dev/null 2>&1; then
         log "Go Control Plane (spark-gateway) is READY on port ${GATEWAY_PORT}!"
