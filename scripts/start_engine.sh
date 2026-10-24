@@ -34,7 +34,7 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 ENGINE_PORT="${ENGINE_PORT:-8000}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.850}"
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-16400000000}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-14600000000}"
 MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-4096}"
 SPEC_ENABLED="${SPEC_ENABLED:-1}"
 
@@ -86,8 +86,8 @@ docker run --rm --privileged --gpus all --pid=host --ipc=host -v /proc:/host_pro
   pkill -9 -x chrome 2>/dev/null || true
   pkill -9 -x gnome-shell 2>/dev/null || true
   pkill -9 -x Xorg 2>/dev/null || true
-  pkill -9 -f "_offline_compiler_spawn_environment" 2>/dev/null || true
-  pkill -9 -f "multiprocessing.spawn import spawn_main" 2>/dev/null || true
+  pkill -9 -f "[_]offline_compiler_spawn_environment" 2>/dev/null || true
+  pkill -9 -f "[m]ultiprocessing.spawn import spawn_main" 2>/dev/null || true
   nsenter -t 1 -m -u -i -n -p swapoff -a 2>/dev/null || true
   echo 0 > /host_proc/sys/vm/watermark_boost_factor 2>/dev/null || true
   echo 65536 > /host_proc/sys/vm/min_free_kbytes 2>/dev/null || true
@@ -106,8 +106,8 @@ ssh -o BatchMode=yes "$WORKER_HOST" "docker run --rm --privileged --gpus all --p
   pkill -9 -x chrome 2>/dev/null || true
   pkill -9 -x gnome-shell 2>/dev/null || true
   pkill -9 -x Xorg 2>/dev/null || true
-  pkill -9 -f \"_offline_compiler_spawn_environment\" 2>/dev/null || true
-  pkill -9 -f \"multiprocessing.spawn import spawn_main\" 2>/dev/null || true
+  pkill -9 -f \"[_]offline_compiler_spawn_environment\" 2>/dev/null || true
+  pkill -9 -f \"[m]ultiprocessing.spawn import spawn_main\" 2>/dev/null || true
   nsenter -t 1 -m -u -i -n -p swapoff -a 2>/dev/null || true
   echo 0 > /host_proc/sys/vm/watermark_boost_factor 2>/dev/null || true
   echo 65536 > /host_proc/sys/vm/min_free_kbytes 2>/dev/null || true

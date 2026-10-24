@@ -4,9 +4,14 @@ All notable changes, hardware fixes, and benchmark updates to **`Spark-GLM53`** 
 
 ---
 
-## [2026-10-23] — Cold-Boot UMA Fix, Dual-Node Power/Thermal Telemetry & TensorFold Comparison
+## [2026-10-23] — Cold-Boot UMA Fix, Long-Context Boundary-Checkpoint UMA Fix & Dual-Node Power/Thermal Telemetry
 
 ### Fixed
+- **Long-Context Multi-Turn Boundary-Checkpoint UMA Exhaustion (`140K–313K+` Tokens) (`worker/b12x_dflash_runner.py`, `scripts/start_engine.sh`)**:
+  - **2-Slot `mHC` Ping-Pong Buffer & `1 GiB` Layer-Boundary Reserve Cap:** Patched `b12x.norm.mhc._impl._b12x_mhc_post_pre_impl` and `Glm5NextModel.forward` (`n_toks > 64`) to reuse a 2-slot ping-pong buffer for `(residual_out, y_out, post_out, comb_out)` across all 160 `hc_fused_post_pre` calls per forward pass and capped unallocated `CUDACachingAllocator` reserve at `1 GiB` (`1024 MiB`), eliminating the `+64 MiB/call` (`+10.24 GiB`/forward) segment-splitting cascade at `n_toks ≈ 2,000–2,048` with zero impact on `llama-benchy` throughput (`c=1..8`).
+  - **Zero-Allocation In-Place KV Block CoW (`copy_kv_cache_blocks_inplace`):** Replaced advanced-indexing `blocks[dst] = blocks[src]` (which allocated `K × 29.6 MiB` temporary GPU buffers on prefix-cache copy-on-write) with in-place `blocks[d_blk].copy_(blocks[s_blk], non_blocking=True)`.
+  - **Direct 2D UVA NumPy `stage_write` & Pinned Host Cache Release:** Patched `StagedWriteTensor.stage_write` (`all_token_ids`, `prefill_positions`, `trace_token_ids`) to write directly into `_uva_buf.np[index, start:end]` on CPU without growing `UvaBufferPool` (`CachingHostAllocator`) and added `torch._C._host_emptyCache()` to `_spark_release_idle_uma_caches`.
+  - **Boot UMA Headroom & `start_engine.sh` Hygiene:** Tuned default `KV_CACHE_MEMORY_BYTES` to `14600000000` (`13.60 GiB`, `2.36M` FP8 KV tokens, leaving `~4.0–4.3 GiB` free UMA on Head and `~6.3–6.6 GiB` on Worker) and bracket-escaped `pkill -9 -f "[_]offline_compiler_spawn_environment"` so step 1b never matches its own `sh -c` subshell.
 - **Multi-Chunk Prefill UMA Exhaustion (`earlyoom` on 18K–30K+ Token Prompts) (`worker/b12x_dflash_runner.py`)**:
   - Synchronized the CUDA stream (`torch.cuda.synchronize()`) before `torch.cuda.empty_cache()` on prefill chunks (`n_toks > 64`) in `_patched_execute_model` and `_patched_sample_tokens` so intermediate prefill chunks (`num_logits == 0`) do not queue ahead of the GPU and accumulate `CUDACachingAllocator` scratch buffers across chunks.
   - Lowered the `nvfp4_materialize_intermediate = False` (`dynamic_tile_m = 64`) threshold in `_sanitize_moe_assignment` and `_patched_job_lookup` from `> 2048` to `>= 256` tokens so prefill tail chunks between `256` and `2,048` tokens do not allocate intermediate materialization buffers.
