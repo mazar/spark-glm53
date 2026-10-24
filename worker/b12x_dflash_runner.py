@@ -1453,7 +1453,8 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
         if warmup_done and not dummy_run and n_toks > 0:
             self._spark_step_cnt = step_cnt + 1
             self._spark_last_exec_toks = n_toks
-            if n_toks >= 512:
+            if n_toks > 64:
+                torch.cuda.synchronize()
                 last_pref = getattr(self, "_spark_last_prefill_toks", 0)
                 if n_toks != last_pref:
                     torch.cuda.empty_cache()
@@ -1609,6 +1610,7 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             if prof is None:
                 res = orig_sample_tokens(self, grammar_output, *args, **kwargs)
                 if getattr(self, "_spark_last_exec_toks", 0) > 64 or grammar_output is not None:
+                    torch.cuda.synchronize()
                     if (
                         torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
                         > 64 * 1024 * 1024
@@ -2154,7 +2156,7 @@ def _patch_l2_prefetch_and_indexer_workspace() -> None:
             def _sanitize_moe_assignment(
                 component_id: str, q_dict: dict[str, Any], raw_assign: dict[str, Any]
             ) -> dict[str, Any]:
-                if component_id == "moe.decode" and int(q_dict.get("num_tokens", 0) or 0) > 2048:
+                if component_id == "moe.decode" and int(q_dict.get("num_tokens", 0) or 0) >= 256:
                     out = dict(raw_assign)
                     target_tile_m = int(os.getenv("SPARK_B12X_PREFILL_TILE_M", "64"))
                     if out.get("dynamic_tile_m") in (32, 64, 128) and out.get("dynamic_tile_m") != target_tile_m:
@@ -2179,7 +2181,7 @@ def _patch_l2_prefetch_and_indexer_workspace() -> None:
                     if (
                         obligation.selection is not None
                         and contract.component_id == "moe.decode"
-                        and int(q_dict.get("num_tokens", 0) or 0) > 2048
+                        and int(q_dict.get("num_tokens", 0) or 0) >= 256
                     ):
                         cur_cfg = obligation.selection.config
                         target_tile_m = int(os.getenv("SPARK_B12X_PREFILL_TILE_M", "64"))

@@ -7,12 +7,18 @@ All notable changes, hardware fixes, and benchmark updates to **`Spark-GLM53`** 
 ## [2026-10-23] — Cold-Boot UMA Fix, Dual-Node Power/Thermal Telemetry & TensorFold Comparison
 
 ### Fixed
+- **Multi-Chunk Prefill UMA Exhaustion (`earlyoom` on 18K–30K+ Token Prompts) (`worker/b12x_dflash_runner.py`)**:
+  - Synchronized the CUDA stream (`torch.cuda.synchronize()`) before `torch.cuda.empty_cache()` on prefill chunks (`n_toks > 64`) in `_patched_execute_model` and `_patched_sample_tokens` so intermediate prefill chunks (`num_logits == 0`) do not queue ahead of the GPU and accumulate `CUDACachingAllocator` scratch buffers across chunks.
+  - Lowered the `nvfp4_materialize_intermediate = False` (`dynamic_tile_m = 64`) threshold in `_sanitize_moe_assignment` and `_patched_job_lookup` from `> 2048` to `>= 256` tokens so prefill tail chunks between `256` and `2,048` tokens do not allocate intermediate materialization buffers.
 - **Cold-Boot `/dev/shm` Duplicate Dense Allocation (`earlyoom` after `./stop.sh --purge-shm`)** ([#4](https://github.com/mazar/spark-glm53/pull/4), `2c952af`):
   - Prevented `_bind_shm_views_to_model(..., is_cold_rebind=True)` in `worker/shm_safetensors.py` and `scripts/start_engine.sh` (`SPARK_SHM_MATERIALIZE_DENSE=0`) from cloning an extra `4.75 GiB` of dense/MXFP8 weights into `cudaMalloc` while `85.28 GiB` is still resident in `/dev/shm` during a first-time cold export (before `spark-cuda-ipc-weights` migrates slabs into GPU memory and punches holes in `/dev/shm`).
 - **Repository & Benchmark Links in `README.md`** ([#3](https://github.com/mazar/spark-glm53/pull/3), `187b69e`):
   - Updated and verified links to [`SeraphimSerapis/tool-eval-bench`](https://github.com/SeraphimSerapis/tool-eval-bench), [`eugr/llama-benchy`](https://github.com/eugr/llama-benchy), [`MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks), [`MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold`](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold), and [`eugr/spark-vllm-docker`](https://github.com/eugr/spark-vllm-docker).
 
 ### Added
+- **Strict Served-Model Validation, Runtime Alias Config (`config/model_aliases.json`), Effort Mapping & `/v1/messages/count_tokens` (`pkg/gateway/main.go`)**:
+  - Enforced strict served-model validation (`GLM-5.3-Flash` by default) across `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, and `/v1/models/{id}`, returning HTTP `404` when an unconfigured model name is requested while allowing users to define runtime model aliases (and optional per-alias default effort) via `config/model_aliases.json` (`ModTime` hot-reload) or `--served-models` / `SERVED_MODEL_NAMES`.
+  - Added support for `output_config.effort`, `thinking.type: "adaptive"`, `"xhigh"` $\rightarrow$ `"max"` effort mapping, HTTP `400` validation for unsupported effort values, `supported_reasoning_efforts` metadata on `/v1/models`, and `POST /v1/messages/count_tokens`.
 - **Side-by-Side `Spark-GLM53` vs. `TensorFold` Throughput, Power & Thermal Benchmarks** ([#2](https://github.com/mazar/spark-glm53/pull/2), `c708561`):
   - Benchmarked `MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold` (`PARALLEL=8`) head-to-head against `Spark-GLM53` on the exact same 2x DGX Spark cluster using `llama-benchy` (`--pp 512 --tg 256 --exact-tg --no-cache --concurrency 1 2 4 8`) and `scripts/run_power_temp_bench.py`:
     - **Cluster Active Average GPU Power:** **`70.53 W`** (`Spark-GLM53`) vs. `122.05 W` (`TensorFold`) — **`42.2%` lower power (`-51.5 W`)**.
