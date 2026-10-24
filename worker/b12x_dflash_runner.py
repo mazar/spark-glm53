@@ -1296,6 +1296,300 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
     except Exception:
         pass
 
+    # Patch copy_kv_cache_blocks_inplace to perform zero-allocation in-place block
+    # copies (`blocks[d_blk].copy_(blocks[s_blk])`) instead of `blocks[dst] = blocks[src]`
+    # advanced indexing (which allocates K * 29.6 MiB temporary GPU buffers on prefix CoW).
+    try:
+        import vllm.v1.worker.utils as _w_utils_mod
+        import vllm.v1.worker.gpu.model_runner as _mr_mod2
+
+        def _spark_copy_kv_cache_blocks_inplace(
+            kv_caches: Any,
+            num_blocks: int,
+            kv_cache_block_copies: Any,
+        ) -> None:
+            if not kv_cache_block_copies:
+                return
+            seen: set[tuple[torch.device, int]] = set()
+            copied_storages: set[tuple[torch.device, int]] = set()
+            for cache in kv_caches:
+                key = (cache.device, cache.data_ptr())
+                if key in seen:
+                    continue
+                seen.add(key)
+                kernel_blocks_per_block, remainder = divmod(cache.shape[0], num_blocks)
+                assert remainder == 0, (
+                    f"{cache.shape[0]} kernel blocks not divisible by "
+                    f"{num_blocks} scheduler blocks"
+                )
+                storage = cache.untyped_storage()
+                storage_key = (cache.device, storage.data_ptr())
+                scheduler_block_stride = (
+                    cache.stride(0) * cache.element_size() * kernel_blocks_per_block
+                )
+                if storage.nbytes() == num_blocks * scheduler_block_stride:
+                    if storage_key in copied_storages:
+                        continue
+                    copied_storages.add(storage_key)
+                    blocks = torch.empty(0, dtype=torch.uint8, device=cache.device)
+                    blocks.set_(storage)
+                    blocks = blocks.view(num_blocks, -1)
+                else:
+                    blocks = cache.unflatten(0, (num_blocks, kernel_blocks_per_block))
+                for pair in kv_cache_block_copies:
+                    s_blk = int(pair[0])
+                    d_blk = int(pair[1])
+                    if s_blk != d_blk:
+                        blocks[d_blk].copy_(blocks[s_blk], non_blocking=True)
+
+        _w_utils_mod.copy_kv_cache_blocks_inplace = _spark_copy_kv_cache_blocks_inplace
+        _mr_mod2.copy_kv_cache_blocks_inplace = _spark_copy_kv_cache_blocks_inplace
+        try:
+            import vllm.v1.worker.gpu_model_runner as _gmr_mod
+
+            _gmr_mod.copy_kv_cache_blocks_inplace = _spark_copy_kv_cache_blocks_inplace
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[spark-warn] Failed to patch copy_kv_cache_blocks_inplace: {e}", flush=True)
+
+    def _spark_mem_snap(tag: str) -> None:
+        if os.getenv("SPARK_TRACE_BC_MEM", "0") != "1":
+            return
+        try:
+            torch.cuda.synchronize()
+            alloc_mb = torch.cuda.memory_allocated() / 1048576.0
+            rsv_mb = torch.cuda.memory_reserved() / 1048576.0
+            st = torch.cuda.memory_stats()
+            act_mb = st.get("active_bytes.all.current", 0) / 1048576.0
+            spl_mb = st.get("inactive_split_bytes.all.current", 0) / 1048576.0
+            avail_mb = -1
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        avail_mb = int(line.split()[1]) // 1024
+                        break
+            print(
+                f"[spark-bc-mem] {tag}: cuda_alloc={alloc_mb:.1f}MB act={act_mb:.1f}MB split={spl_mb:.1f}MB cuda_rsv={rsv_mb:.1f}MB host_avail={avail_mb}MB",
+                flush=True,
+            )
+        except Exception:
+            pass
+
+    orig_add_requests = GPUModelRunner.add_requests
+    orig_update_requests = GPUModelRunner.update_requests
+    orig_prepare_attn = GPUModelRunner.prepare_attn
+
+    def _patched_add_requests(self: GPUModelRunner, scheduler_output: Any) -> Any:
+        trace = bool(getattr(scheduler_output, "kv_cache_block_copies", None))
+        if trace:
+            _spark_mem_snap("before_add_requests")
+        res = orig_add_requests(self, scheduler_output)
+        if trace:
+            _spark_mem_snap("after_add_requests")
+        return res
+
+    def _patched_update_requests(self: GPUModelRunner, scheduler_output: Any) -> Any:
+        trace = bool(getattr(scheduler_output, "kv_cache_block_copies", None))
+        if trace:
+            _spark_mem_snap("before_update_requests")
+        res = orig_update_requests(self, scheduler_output)
+        if trace:
+            _spark_mem_snap("after_update_requests")
+        return res
+
+    def _patched_prepare_attn(self: GPUModelRunner, *a: Any, **kw: Any) -> Any:
+        res = orig_prepare_attn(self, *a, **kw)
+        if getattr(self, "_spark_trace_bc_step", False):
+            _spark_mem_snap("after_prepare_attn")
+        return res
+
+    GPUModelRunner.add_requests = _patched_add_requests
+    GPUModelRunner.update_requests = _patched_update_requests
+    GPUModelRunner.prepare_attn = _patched_prepare_attn
+
+    try:
+        from vllm.models.glm5next.model_state import Glm5NextModelState
+        from vllm.models.glm5next.nvidia import model as _glm_nv_mod
+        import b12x.norm.mhc._impl as _b12x_mhc_impl_mod
+
+        _spark_mhc_active_pool: list[dict[str, torch.Tensor]] | None = None
+        _orig_mhc_post_pre_impl = _b12x_mhc_impl_mod._b12x_mhc_post_pre_impl
+
+        def _patched_mhc_post_pre_impl(
+            x: torch.Tensor,
+            residual: torch.Tensor,
+            prev_post: torch.Tensor,
+            prev_comb: torch.Tensor,
+            fn: torch.Tensor,
+            hc_scale: torch.Tensor,
+            hc_base: torch.Tensor,
+            **kw: Any,
+        ) -> Any:
+            pool = _spark_mhc_active_pool
+            if (
+                pool is not None
+                and kw.get("binding") is None
+                and kw.get("residual_out") is None
+                and kw.get("y_out") is None
+                and kw.get("post_out") is None
+                and kw.get("comb_out") is None
+                and residual.ndim == 3
+                and residual.shape[0] == pool[0]["residual"].shape[0]
+            ):
+                r_ptr = residual.data_ptr()
+                x_ptr = x.data_ptr()
+                slot0 = pool[0]
+                slot = (
+                    pool[1]
+                    if (
+                        r_ptr == slot0["residual"].data_ptr()
+                        or x_ptr == slot0["y"].data_ptr()
+                    )
+                    else slot0
+                )
+                kw["residual_out"] = slot["residual"]
+                kw["y_out"] = slot["y"]
+                kw["post_out"] = slot["post"]
+                kw["comb_out"] = slot["comb"]
+            return _orig_mhc_post_pre_impl(
+                x, residual, prev_post, prev_comb, fn, hc_scale, hc_base, **kw
+            )
+
+        _b12x_mhc_impl_mod._b12x_mhc_post_pre_impl = _patched_mhc_post_pre_impl
+
+        orig_ms_preprocess = Glm5NextModelState.preprocess_state
+        orig_ms_prep_attn = Glm5NextModelState.prepare_attn
+
+        def _patched_ms_preprocess(self: Any, *a: Any, **kw: Any) -> Any:
+            res = orig_ms_preprocess(self, *a, **kw)
+            if os.getenv("SPARK_TRACE_BC_MEM", "0") == "1" and getattr(self, "_spark_in_bc_trace", False):
+                _spark_mem_snap("after_ms_preprocess_state")
+            return res
+
+        def _patched_ms_prep_attn(self: Any, *a: Any, **kw: Any) -> Any:
+            res = orig_ms_prep_attn(self, *a, **kw)
+            if os.getenv("SPARK_TRACE_BC_MEM", "0") == "1" and getattr(self, "_spark_in_bc_trace", False):
+                _spark_mem_snap("after_ms_prepare_attn")
+            return res
+
+        Glm5NextModelState.preprocess_state = _patched_ms_preprocess
+        Glm5NextModelState.prepare_attn = _patched_ms_prep_attn
+
+        orig_glm_nv_fwd = _glm_nv_mod.Glm5NextModel.forward
+        orig_glm_nv_layer_fwd = _glm_nv_mod.Glm5NextDecoderLayer.forward
+
+        def _patched_glm_nv_layer_fwd(self: Any, *a: Any, **kw: Any) -> Any:
+            trace = bool(getattr(self, "_spark_in_bc_trace", False))
+            rsv0 = torch.cuda.memory_reserved() if trace else 0
+            res = orig_glm_nv_layer_fwd(self, *a, **kw)
+            if _spark_mhc_active_pool is not None:
+                if (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > 1024 * 1048576:
+                    torch.cuda.empty_cache()
+            if trace:
+                l_idx = getattr(self, "layer_idx", -1)
+                rsv1 = torch.cuda.memory_reserved()
+                if l_idx in (0, 3, 4, 5, 79) or (rsv1 - rsv0) > 64 * 1048576:
+                    _spark_mem_snap(f"after_layer_{l_idx}(drsv={(rsv1-rsv0)/1048576:.1f}MB)")
+            return res
+
+        def _patched_glm_nv_fwd(self: Any, *a: Any, **kw: Any) -> Any:
+            nonlocal _spark_mhc_active_pool
+            trace = bool(getattr(self, "_spark_in_bc_trace", False))
+            pos = a[1] if len(a) > 1 else kw.get("positions")
+            n_toks = int(pos.shape[0]) if isinstance(pos, torch.Tensor) and pos.ndim >= 1 else 0
+            use_pool = (
+                n_toks > 64
+                and not torch.cuda.is_current_stream_capturing()
+                and not torch.compiler.is_compiling()
+            )
+            if use_pool:
+                dev = pos.device
+                h_sz = int(self.config.hidden_size)
+                _spark_mhc_active_pool = [
+                    {
+                        "residual": torch.empty((n_toks, 4, h_sz), dtype=torch.bfloat16, device=dev),
+                        "y": torch.empty((n_toks, h_sz), dtype=torch.bfloat16, device=dev),
+                        "post": torch.empty((n_toks, 4), dtype=torch.float32, device=dev),
+                        "comb": torch.empty((n_toks, 4, 4), dtype=torch.float32, device=dev),
+                    }
+                    for _ in range(2)
+                ]
+            if trace:
+                _spark_mem_snap("before_glm_model_forward")
+                for lyr in getattr(self, "_active_layers", ()):
+                    lyr._spark_in_bc_trace = True
+            try:
+                res = orig_glm_nv_fwd(self, *a, **kw)
+                if trace:
+                    _spark_mem_snap("after_glm_model_forward")
+                return res
+            finally:
+                if use_pool:
+                    _spark_mhc_active_pool = None
+                    if (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > 1024 * 1048576:
+                        torch.cuda.empty_cache()
+                if trace:
+                    for lyr in getattr(self, "_active_layers", ()):
+                        lyr._spark_in_bc_trace = False
+
+        _glm_nv_mod.Glm5NextDecoderLayer.forward = _patched_glm_nv_layer_fwd
+        _glm_nv_mod.Glm5NextModel.forward = _patched_glm_nv_fwd
+    except Exception as e:
+        print(f"[spark-warn] Failed to install mhc pingpong + bc trace hooks: {e}", flush=True)
+
+    # Patch StagedWriteTensor.stage_write for UVA-backed 2D tensors (`all_token_ids`,
+    # `prefill_positions`, `trace_token_ids`) so long 100K+ prompts write directly into
+    # the pre-allocated `_uva_buf.np` row without growing `UvaBufferPool` pinned host
+    # memory (`CachingHostAllocator` / `_memdescAllocInternal`) on every turn.
+    try:
+        from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+
+        orig_stage_write = StagedWriteTensor.stage_write
+
+        def _spark_stage_write(
+            self: StagedWriteTensor,
+            index: int,
+            start: int,
+            x: Any,
+        ) -> None:
+            if (
+                self.write_contents is not None
+                and hasattr(self, "_uva_buf")
+                and getattr(self._uva_buf, "np", None) is not None
+                and self._uva_buf.np.ndim == 2
+            ):
+                assert index >= 0 and start >= 0
+                if not x:
+                    return
+                if not isinstance(x, (list, tuple, np.ndarray, torch.Tensor)):
+                    x = list(x)
+                n_elems = len(x)
+                if n_elems > 0:
+                    self._uva_buf.np[index, start : start + n_elems] = x
+                return
+            orig_stage_write(self, index, start, x)
+
+        StagedWriteTensor.stage_write = _spark_stage_write
+    except Exception:
+        pass
+
+    def _spark_release_idle_uma_caches(
+        min_free_cuda_bytes: int = 32 * 1024 * 1024,
+        release_host_cache: bool = True,
+    ) -> None:
+        if torch.cuda.is_available():
+            if (
+                torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+                > min_free_cuda_bytes
+            ):
+                torch.cuda.empty_cache()
+        if release_host_cache and hasattr(torch._C, "_host_emptyCache"):
+            try:
+                torch._C._host_emptyCache()
+            except Exception:
+                pass
+
     def _get_inner_glm_model(runner: GPUModelRunner) -> Any:
         m = getattr(runner, "model", None)
         for sub_name in ("language_model", "model"):
@@ -1442,6 +1736,19 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
 
         self._spark_skip_aux_current = skip_aux
         self._spark_skip_bc_current = skip_bc
+        self._spark_trace_bc_step = bool(
+            not dummy_run
+            and scheduler_output is not None
+            and getattr(scheduler_output, "kv_cache_block_copies", None)
+        )
+        self._spark_trace_bc_sample = self._spark_trace_bc_step
+        if self._spark_trace_bc_step:
+            _spark_mem_snap(f"start_execute_model(n_toks={n_toks})")
+            if getattr(self, "model_state", None) is not None:
+                self.model_state._spark_in_bc_trace = True
+            ig = _get_inner_glm_model(self)
+            if ig is not None:
+                ig._spark_in_bc_trace = True
         _set_model_skip_aux(self, skip_aux)
         if is_homog_exec:
             _set_model_homog_reqs(self, num_homog_reqs)
@@ -1453,12 +1760,14 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
         if warmup_done and not dummy_run and n_toks > 0:
             self._spark_step_cnt = step_cnt + 1
             self._spark_last_exec_toks = n_toks
-            if n_toks > 64:
-                torch.cuda.synchronize()
-                last_pref = getattr(self, "_spark_last_prefill_toks", 0)
-                if n_toks != last_pref:
-                    torch.cuda.empty_cache()
-                self._spark_last_prefill_toks = n_toks
+            has_bc_cow = bool(getattr(scheduler_output, "kv_cache_block_copies", None))
+            if has_bc_cow or ((step_cnt + 1) % 512 == 0):
+                _spark_release_idle_uma_caches(
+                    min_free_cuda_bytes=1024 * 1024 * 1024,
+                    release_host_cache=True,
+                )
+            elif (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > 1024 * 1024 * 1024:
+                torch.cuda.empty_cache()
         prof_enabled = (
             warmup_done
             and not dummy_run
@@ -1528,6 +1837,14 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             res = orig_execute_model(self, scheduler_output, *args, **kwargs)
             return res
         finally:
+            if getattr(self, "_spark_trace_bc_step", False):
+                _spark_mem_snap("after_execute_model")
+                self._spark_trace_bc_step = False
+                if getattr(self, "model_state", None) is not None:
+                    self.model_state._spark_in_bc_trace = False
+                ig = _get_inner_glm_model(self)
+                if ig is not None:
+                    ig._spark_in_bc_trace = False
             if self.cudagraph_manager is not None:
                 self.cudagraph_manager._spark_force_eager = False
             if is_homog_exec:
@@ -1605,17 +1922,18 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
         saved_bc = self.boundary_checkpoint_state
         if skip_decode_bc:
             self.boundary_checkpoint_state = None
+        trace_samp = bool(getattr(self, "_spark_trace_bc_sample", False))
+        self._spark_trace_bc_sample = False
+        if trace_samp:
+            _spark_mem_snap("before_sample_tokens")
         try:
             prof = getattr(self, "_spark_active_profile", None)
             if prof is None:
                 res = orig_sample_tokens(self, grammar_output, *args, **kwargs)
-                if getattr(self, "_spark_last_exec_toks", 0) > 64 or grammar_output is not None:
-                    torch.cuda.synchronize()
-                    if (
-                        torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-                        > 64 * 1024 * 1024
-                    ):
-                        torch.cuda.empty_cache()
+                if trace_samp:
+                    _spark_mem_snap("after_sample_tokens")
+                if (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > 1024 * 1024 * 1024:
+                    torch.cuda.empty_cache()
                 return res
 
             self._spark_active_profile = None
@@ -1626,12 +1944,10 @@ def _patch_dflash2_context_cudagraph_and_copy_drafter() -> None:
             ev2.record()
             t3 = time.perf_counter()
             ev2.synchronize()
-            if n_toks >= 512:
-                if (
-                    torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-                    > 64 * 1024 * 1024
-                ):
-                    torch.cuda.empty_cache()
+            if trace_samp:
+                _spark_mem_snap("after_sample_tokens")
+            if (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > 1024 * 1024 * 1024:
+                torch.cuda.empty_cache()
             fwd_gpu_ms = ev0.elapsed_time(ev1)
             samp_prop_gpu_ms = ev1.elapsed_time(ev2)
             tot_gpu_ms = ev0.elapsed_time(ev2)
