@@ -489,7 +489,24 @@ func init() {
 	}
 }
 
-func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
+func parseKnownEffort(raw string) (effort string, enableThinking bool, valid bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "none", "off", "disable", "disabled":
+		return "low", false, true
+	case "low":
+		return "low", true, true
+	case "medium":
+		return "medium", true, true
+	case "high":
+		return "high", true, true
+	case "max", "xhigh":
+		return "max", true, true
+	default:
+		return "", false, false
+	}
+}
+
+func NormalizeReasoningAndMessages(reqMap map[string]any) (ReasoningConfig, error) {
 	cfg := ReasoningConfig{
 		Effort:         "max",
 		EnableThinking: true,
@@ -504,7 +521,7 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		ctk = make(map[string]any)
 	}
 
-	// Extract reasoning_effort from top-level, reasoning.effort, or chat_template_kwargs
+	// Extract reasoning_effort from top-level, reasoning.effort, output_config.effort, or chat_template_kwargs
 	var rawEffort string
 	if v, ok := reqMap["reasoning_effort"].(string); ok && v != "" {
 		rawEffort = strings.ToLower(strings.TrimSpace(v))
@@ -512,11 +529,25 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		if v, ok := rObj["effort"].(string); ok && v != "" {
 			rawEffort = strings.ToLower(strings.TrimSpace(v))
 		}
+	} else if ocObj, ok := reqMap["output_config"].(map[string]any); ok {
+		if v, ok := ocObj["effort"].(string); ok && v != "" {
+			rawEffort = strings.ToLower(strings.TrimSpace(v))
+		}
 	} else if v, ok := ctk["reasoning_effort"].(string); ok && v != "" {
 		rawEffort = strings.ToLower(strings.TrimSpace(v))
 	}
 	delete(reqMap, "reasoning_effort")
 	delete(reqMap, "reasoning")
+	delete(reqMap, "output_config")
+
+	if rawEffort != "" {
+		eff, en, valid := parseKnownEffort(rawEffort)
+		if !valid {
+			return cfg, fmt.Errorf("unsupported reasoning effort %q (supported values: none, low, medium, high, max, xhigh)", rawEffort)
+		}
+		cfg.Effort = eff
+		cfg.EnableThinking = en
+	}
 
 	if v, ok := ctk["enable_thinking"].(bool); ok {
 		cfg.EnableThinking = v
@@ -526,32 +557,26 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		delete(reqMap, "enable_thinking")
 	}
 
-	switch rawEffort {
-	case "none", "off", "disable", "disabled":
+	if !cfg.EnableThinking {
 		cfg.Effort = "low"
-		cfg.EnableThinking = false
 		cfg.SoftTokenCap = 0
 		cfg.HardTokenCap = 0
-	case "low":
-		cfg.Effort = "low"
-		cfg.SoftTokenCap = 192
-		cfg.HardTokenCap = 32768
-	case "medium":
-		cfg.Effort = "medium"
-		cfg.SoftTokenCap = 768
-		cfg.HardTokenCap = 32768
-	case "high":
-		cfg.Effort = "high"
-		cfg.SoftTokenCap = 3072
-		cfg.HardTokenCap = 32768
-	case "max", "":
-		cfg.Effort = "max"
-		cfg.SoftTokenCap = 32768
-		cfg.HardTokenCap = 32768
-	default:
-		cfg.Effort = "max"
-		cfg.SoftTokenCap = 32768
-		cfg.HardTokenCap = 32768
+	} else {
+		switch cfg.Effort {
+		case "low":
+			cfg.SoftTokenCap = 192
+			cfg.HardTokenCap = 32768
+		case "medium":
+			cfg.SoftTokenCap = 768
+			cfg.HardTokenCap = 32768
+		case "high":
+			cfg.SoftTokenCap = 3072
+			cfg.HardTokenCap = 32768
+		default:
+			cfg.Effort = "max"
+			cfg.SoftTokenCap = 32768
+			cfg.HardTokenCap = 32768
+		}
 	}
 
 	// When response_format (json_schema / json_object) is active, vLLM's guided decoding
@@ -588,7 +613,7 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 	// prior to the final user turn when clear_thinking is enabled.
 	rawMsgs, ok := reqMap["messages"].([]any)
 	if !ok || len(rawMsgs) == 0 {
-		return cfg
+		return cfg, nil
 	}
 
 	lastUserIdx := -1
@@ -653,7 +678,7 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) ReasoningConfig {
 		}
 	}
 
-	return cfg
+	return cfg, nil
 }
 
 // ============================================================================
@@ -1019,26 +1044,207 @@ type GatewayServer struct {
 	upstreamURL       string
 	client            *http.Client
 	router            *RadixPrefixRouter
+	configMu          sync.Mutex
+	baseModels        []string
+	baseEfforts       map[string]string
+	aliasesConfigPath string
+	aliasesModTime    time.Time
+	servedModels      map[string]bool
+	servedModelList   []string
+	modelEfforts      map[string]string
 	totalRequests     atomic.Uint64
 	repairedToolCalls atomic.Uint64
 	loopGuardAborts   atomic.Uint64
 	clientDisconnects atomic.Uint64
 }
 
-func NewGatewayServer(upstreamURL string, router *RadixPrefixRouter) *GatewayServer {
+func parseModelSpec(spec string) (name string, effort string) {
+	spec = strings.TrimSpace(spec)
+	if idx := strings.IndexByte(spec, ':'); idx > 0 {
+		name = strings.TrimSpace(spec[:idx])
+		effRaw := strings.TrimSpace(spec[idx+1:])
+		if eff, _, ok := parseKnownEffort(effRaw); ok {
+			if strings.EqualFold(effRaw, "none") || strings.EqualFold(effRaw, "off") || strings.EqualFold(effRaw, "disabled") {
+				effort = "none"
+			} else {
+				effort = eff
+			}
+		}
+		return name, effort
+	}
+	return spec, ""
+}
+
+func NewGatewayServer(upstreamURL string, router *RadixPrefixRouter, servedSpecs []string, aliasesConfigPath string) *GatewayServer {
 	tr := &http.Transport{
 		MaxIdleConns:        256,
 		MaxIdleConnsPerHost: 256,
 		IdleConnTimeout:     90 * time.Second,
 	}
-	return &GatewayServer{
+	seen := make(map[string]bool)
+	var baseList []string
+	baseEfforts := make(map[string]string)
+	for _, raw := range servedSpecs {
+		m, eff := parseModelSpec(raw)
+		if m != "" && !seen[m] {
+			seen[m] = true
+			baseList = append(baseList, m)
+		}
+		if m != "" && eff != "" {
+			baseEfforts[m] = eff
+		}
+	}
+	if len(baseList) == 0 {
+		baseList = []string{"GLM-5.3-Flash"}
+	}
+	gs := &GatewayServer{
 		upstreamURL: strings.TrimRight(upstreamURL, "/"),
 		client: &http.Client{
 			Transport: tr,
 			Timeout:   600 * time.Second,
 		},
-		router: router,
+		router:            router,
+		baseModels:        baseList,
+		baseEfforts:       baseEfforts,
+		aliasesConfigPath: aliasesConfigPath,
 	}
+	gs.refreshServedModels()
+	return gs
+}
+
+func (gs *GatewayServer) refreshServedModels() {
+	gs.configMu.Lock()
+	defer gs.configMu.Unlock()
+
+	if gs.aliasesConfigPath != "" {
+		if st, err := os.Stat(gs.aliasesConfigPath); err == nil && !st.IsDir() {
+			if gs.servedModels != nil && st.ModTime().Equal(gs.aliasesModTime) {
+				return
+			}
+			gs.aliasesModTime = st.ModTime()
+		} else if gs.servedModels != nil && gs.aliasesModTime.IsZero() {
+			return
+		} else {
+			gs.aliasesModTime = time.Time{}
+		}
+	} else if gs.servedModels != nil {
+		return
+	}
+
+	smMap := make(map[string]bool)
+	var smList []string
+	effMap := make(map[string]string)
+	addModel := func(m, eff string) {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			return
+		}
+		if !smMap[m] {
+			smMap[m] = true
+			smList = append(smList, m)
+		}
+		if eff != "" {
+			if norm, _, ok := parseKnownEffort(eff); ok {
+				if strings.EqualFold(eff, "none") || strings.EqualFold(eff, "off") || strings.EqualFold(eff, "disabled") {
+					effMap[m] = "none"
+				} else {
+					effMap[m] = norm
+				}
+			}
+		}
+	}
+
+	for _, m := range gs.baseModels {
+		addModel(m, gs.baseEfforts[m])
+	}
+
+	if gs.aliasesConfigPath != "" {
+		if b, err := os.ReadFile(gs.aliasesConfigPath); err == nil {
+			var parsed map[string]any
+			if json.Unmarshal(b, &parsed) == nil {
+				if modelsArr, ok := parsed["models"].([]any); ok {
+					for _, item := range modelsArr {
+						if s, ok := item.(string); ok {
+							m, eff := parseModelSpec(s)
+							addModel(m, eff)
+						}
+					}
+				}
+				if aliasesMap, ok := parsed["aliases"].(map[string]any); ok {
+					for alias, rawCfg := range aliasesMap {
+						switch v := rawCfg.(type) {
+						case string:
+							addModel(alias, v)
+						case map[string]any:
+							effStr, _ := v["effort"].(string)
+							if effStr == "" {
+								effStr, _ = v["effortLevel"].(string)
+							}
+							if effStr == "" {
+								effStr, _ = v["reasoning_effort"].(string)
+							}
+							addModel(alias, effStr)
+						default:
+							addModel(alias, "")
+						}
+					}
+				}
+			}
+		}
+	}
+
+	gs.servedModels = smMap
+	gs.servedModelList = smList
+	gs.modelEfforts = effMap
+}
+
+func (gs *GatewayServer) isServedModel(modelName string) bool {
+	gs.refreshServedModels()
+	gs.configMu.Lock()
+	defer gs.configMu.Unlock()
+	return gs.servedModels[strings.TrimSpace(modelName)]
+}
+
+func (gs *GatewayServer) getServedModelList() []string {
+	gs.refreshServedModels()
+	gs.configMu.Lock()
+	defer gs.configMu.Unlock()
+	out := make([]string, len(gs.servedModelList))
+	copy(out, gs.servedModelList)
+	return out
+}
+
+func (gs *GatewayServer) getModelDefaultEffort(modelName string) (string, bool) {
+	gs.refreshServedModels()
+	gs.configMu.Lock()
+	defer gs.configMu.Unlock()
+	eff, ok := gs.modelEfforts[strings.TrimSpace(modelName)]
+	return eff, ok && eff != ""
+}
+
+func writeOpenAIError(w http.ResponseWriter, status int, msg, errType, param, code string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    errType,
+			"param":   param,
+			"code":    code,
+		},
+	})
+}
+
+func writeAnthropicError(w http.ResponseWriter, status int, errType, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"type": "error",
+		"error": map[string]any{
+			"type":    errType,
+			"message": msg,
+		},
+	})
 }
 
 func extractTextContent(c any) string {
@@ -1137,10 +1343,31 @@ func (gs *GatewayServer) handleChatCompletions(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	// Normalize model alias to primary served model name
+	reqModel, _ := reqMap["model"].(string)
+	servedList := gs.getServedModelList()
+	if reqModel == "" {
+		reqModel = servedList[0]
+	} else if !gs.isServedModel(reqModel) {
+		writeOpenAIError(w, http.StatusNotFound,
+			fmt.Sprintf("The model %q does not exist (served models: %s).", reqModel, strings.Join(servedList, ", ")),
+			"invalid_request_error", "model", "model_not_found")
+		return
+	}
+	if defEff, ok := gs.getModelDefaultEffort(reqModel); ok {
+		if reqMap["reasoning_effort"] == nil && reqMap["reasoning"] == nil && reqMap["output_config"] == nil {
+			ctk, _ := reqMap["chat_template_kwargs"].(map[string]any)
+			if ctk == nil || ctk["reasoning_effort"] == nil {
+				reqMap["reasoning_effort"] = defEff
+			}
+		}
+	}
 	reqMap["model"] = "GLM-5.3-Flash"
 
-	reasoningCfg := NormalizeReasoningAndMessages(reqMap)
+	reasoningCfg, err := NormalizeReasoningAndMessages(reqMap)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "reasoning_effort", "invalid_value")
+		return
+	}
 
 	var msgs []map[string]any
 	if rawMsgs, ok := reqMap["messages"].([]any); ok {
@@ -1775,14 +2002,22 @@ func (gs *GatewayServer) handleResponsesAPI(w http.ResponseWriter, r *http.Reque
 		messages = append(messages, inp...)
 	}
 
+	reqModel, _ := reqMap["model"].(string)
+	servedList := gs.getServedModelList()
+	if reqModel == "" {
+		reqModel = servedList[0]
+	} else if !gs.isServedModel(reqModel) {
+		writeOpenAIError(w, http.StatusNotFound,
+			fmt.Sprintf("The model %q does not exist (served models: %s).", reqModel, strings.Join(servedList, ", ")),
+			"invalid_request_error", "model", "model_not_found")
+		return
+	}
+
 	chatReq := map[string]any{
-		"model":       reqMap["model"],
+		"model":       "GLM-5.3-Flash",
 		"messages":    messages,
 		"stream":      false,
 		"temperature": reqMap["temperature"],
-	}
-	if chatReq["model"] == nil {
-		chatReq["model"] = "GLM-5.3-Flash"
 	}
 	if maxOut, ok := reqMap["max_output_tokens"]; ok {
 		chatReq["max_tokens"] = maxOut
@@ -1794,7 +2029,10 @@ func (gs *GatewayServer) handleResponsesAPI(w http.ResponseWriter, r *http.Reque
 		chatReq["reasoning"] = reasoning
 	}
 
-	NormalizeReasoningAndMessages(chatReq)
+	if _, err := NormalizeReasoningAndMessages(chatReq); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "reasoning", "invalid_value")
+		return
+	}
 	chatBytes, _ := json.Marshal(chatReq)
 
 	upReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gs.upstreamURL+"/v1/chat/completions", bytes.NewReader(chatBytes))
@@ -1861,7 +2099,7 @@ func (gs *GatewayServer) handleResponsesAPI(w http.ResponseWriter, r *http.Reque
 		"object":     "response",
 		"created_at": time.Now().Unix(),
 		"status":     "completed",
-		"model":      chatReq["model"],
+		"model":      reqModel,
 		"output":     outputItems,
 		"usage":      chatResp["usage"],
 	}
@@ -1899,7 +2137,15 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 
 	var anthReq map[string]any
 	if err := json.Unmarshal(bodyBytes, &anthReq); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON: "+err.Error())
+		return
+	}
+
+	reqModel, _ := anthReq["model"].(string)
+	if !gs.isServedModel(reqModel) {
+		servedList := gs.getServedModelList()
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error",
+			fmt.Sprintf("model %q is not served by this engine (served models: %s)", reqModel, strings.Join(servedList, ", ")))
 		return
 	}
 
@@ -1956,6 +2202,9 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 						})
 					}
 				}
+				for _, tr := range toolResults {
+					oaMsgs = append(oaMsgs, tr)
+				}
 				if len(textParts) > 0 || len(toolCalls) > 0 || thinkingText != "" {
 					msgObj := map[string]any{
 						"role":    role,
@@ -1968,9 +2217,6 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 						msgObj["tool_calls"] = toolCalls
 					}
 					oaMsgs = append(oaMsgs, msgObj)
-				}
-				for _, tr := range toolResults {
-					oaMsgs = append(oaMsgs, tr)
 				}
 			}
 		}
@@ -1992,19 +2238,107 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		}
 	}
 
+	// Support `/v1/messages/count_tokens` and `/messages/count_tokens`
+	if strings.HasSuffix(r.URL.Path, "/count_tokens") {
+		tokPayload, _ := json.Marshal(map[string]any{
+			"model":    "GLM-5.3-Flash",
+			"messages": oaMsgs,
+		})
+		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, gs.upstreamURL+"/tokenize", bytes.NewReader(tokPayload))
+		if err == nil {
+			upReq.Header.Set("Content-Type", "application/json")
+			if resp, err := gs.client.Do(upReq); err == nil {
+				defer resp.Body.Close()
+				if b, err := io.ReadAll(resp.Body); err == nil && resp.StatusCode == http.StatusOK {
+					var tokResp map[string]any
+					if json.Unmarshal(b, &tokResp) == nil {
+						if count, ok := tokResp["count"].(float64); ok {
+							w.Header().Set("Content-Type", "application/json")
+							_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": int(count)})
+							return
+						}
+						if toks, ok := tokResp["tokens"].([]any); ok {
+							w.Header().Set("Content-Type", "application/json")
+							_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": len(toks)})
+							return
+						}
+					}
+				}
+			}
+		}
+		estTokens := len(EstimateTokens(string(bodyBytes)))
+		if estTokens < 1 {
+			estTokens = 1
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"input_tokens": estTokens})
+		return
+	}
+
+	// Resolve requested effort level from output_config.effort, reasoning_effort, thinking block, or configured alias default
 	enableThinking := false
 	reasoningEffort := "low"
+	if defEff, ok := gs.getModelDefaultEffort(reqModel); ok {
+		if eff, en, valid := parseKnownEffort(defEff); valid {
+			reasoningEffort = eff
+			enableThinking = en
+		}
+	}
+
+	var rawEffort string
+	if oc, ok := anthReq["output_config"].(map[string]any); ok {
+		if effStr, ok := oc["effort"].(string); ok && effStr != "" {
+			rawEffort = effStr
+		}
+	}
+	if rawEffort == "" {
+		if effStr, ok := anthReq["reasoning_effort"].(string); ok && effStr != "" {
+			rawEffort = effStr
+		} else if effStr, ok := anthReq["effort"].(string); ok && effStr != "" {
+			rawEffort = effStr
+		}
+	}
+	if rawEffort != "" {
+		eff, en, valid := parseKnownEffort(rawEffort)
+		if !valid {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("unsupported effort level %q (supported values: none, low, medium, high, max, xhigh)", rawEffort))
+			return
+		}
+		reasoningEffort = eff
+		enableThinking = en
+	}
+
 	if th, ok := anthReq["thinking"].(map[string]any); ok {
-		if tType, _ := th["type"].(string); tType == "enabled" {
+		tType, _ := th["type"].(string)
+		switch strings.ToLower(strings.TrimSpace(tType)) {
+		case "disabled", "none", "off":
+			enableThinking = false
+			reasoningEffort = "low"
+		case "enabled", "adaptive":
 			enableThinking = true
-			budget, _ := th["budget_tokens"].(float64)
-			switch {
-			case budget <= 512:
-				reasoningEffort = "low"
-			case budget <= 2048:
-				reasoningEffort = "medium"
-			default:
-				reasoningEffort = "high"
+			if rawEffort == "" {
+				budget, hasBudget := th["budget_tokens"].(float64)
+				if !hasBudget || budget <= 0 {
+					if defEff, ok := gs.getModelDefaultEffort(reqModel); ok {
+						if eff, _, valid := parseKnownEffort(defEff); valid {
+							reasoningEffort = eff
+						}
+					} else {
+						reasoningEffort = "max"
+					}
+				} else {
+					switch {
+					case budget <= 512:
+						reasoningEffort = "low"
+					case budget <= 2048:
+						reasoningEffort = "medium"
+					case budget <= 8192:
+						reasoningEffort = "high"
+					default:
+						reasoningEffort = "max"
+					}
+				}
 			}
 		}
 	}
@@ -2032,6 +2366,7 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 	w.Header().Set("X-Spark-Prefix-Cache-Hit-Blocks", strconv.Itoa(hitBlocks))
 	w.Header().Set("X-Spark-Prefix-Cache-Hit-Tokens", strconv.Itoa(hitTokens))
 	w.Header().Set("X-Spark-NVMe-Spill-Restored", strconv.Itoa(nvmeRestored))
+	w.Header().Set("X-Spark-Reasoning-Effort", reasoningEffort)
 
 	oaBytes, _ := json.Marshal(oaReq)
 	upReq, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, gs.upstreamURL+"/v1/chat/completions", bytes.NewReader(oaBytes))
@@ -2049,7 +2384,7 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		Effort:         reasoningEffort,
 		EnableThinking: enableThinking,
 		ClearThinking:  true,
-		HardTokenCap:   4096,
+		HardTokenCap:   32768,
 	}, "")
 
 	var oaResp map[string]any
@@ -2062,8 +2397,9 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 			if msg, ok := ch["message"].(map[string]any); ok {
 				if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
 					contentBlocks = append(contentBlocks, map[string]any{
-						"type":     "thinking",
-						"thinking": rc,
+						"type":      "thinking",
+						"thinking":  rc,
+						"signature": "spark-glm53-sig",
 					})
 				}
 				if c, ok := msg["content"].(string); ok && c != "" {
@@ -2110,8 +2446,10 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 		"stop_reason":   stopReason,
 		"stop_sequence": nil,
 		"usage": map[string]any{
-			"input_tokens":  int(inToks),
-			"output_tokens": int(outToks),
+			"input_tokens":                int(inToks),
+			"output_tokens":               int(outToks),
+			"cache_read_input_tokens":     hitTokens,
+			"cache_creation_input_tokens": 0,
 		},
 	}
 
@@ -2137,12 +2475,19 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 	sendEvent("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":      anthMsg["id"],
-			"type":    "message",
-			"role":    "assistant",
-			"model":   anthReq["model"],
-			"content": []any{},
-			"usage":   map[string]any{"input_tokens": int(inToks), "output_tokens": 0},
+			"id":            anthMsg["id"],
+			"type":          "message",
+			"role":          "assistant",
+			"model":         anthReq["model"],
+			"content":       []any{},
+			"stop_reason":   nil,
+			"stop_sequence": nil,
+			"usage": map[string]any{
+				"input_tokens":                int(inToks),
+				"output_tokens":               0,
+				"cache_read_input_tokens":     hitTokens,
+				"cache_creation_input_tokens": 0,
+			},
 		},
 	})
 	for idx, blk := range contentBlocks {
@@ -2169,6 +2514,11 @@ func (gs *GatewayServer) handleAnthropicMessages(w http.ResponseWriter, r *http.
 				"type":  "content_block_delta",
 				"index": idx,
 				"delta": map[string]any{"type": "thinking_delta", "thinking": blk["thinking"]},
+			})
+			sendEvent("content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": idx,
+				"delta": map[string]any{"type": "signature_delta", "signature": "spark-glm53-sig"},
 			})
 		case "tool_use":
 			inBytes, _ := json.Marshal(blk["input"])
@@ -2317,13 +2667,54 @@ func (gs *GatewayServer) handleModels(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(body)
 		return
 	}
+
+	var templateModel map[string]any
 	if dataList, ok := parsed["data"].([]any); ok && len(dataList) > 0 {
 		if firstModel, ok := dataList[0].(map[string]any); ok {
-			firstModel["id"] = "GLM-5.3-Flash"
-			firstModel["root"] = "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark"
-			parsed["data"] = []any{firstModel}
+			templateModel = firstModel
 		}
 	}
+	if templateModel == nil {
+		templateModel = map[string]any{
+			"object":   "model",
+			"owned_by": "spark-glm53",
+		}
+	}
+
+	buildEntry := func(id string) map[string]any {
+		cp := make(map[string]any, len(templateModel)+5)
+		for k, v := range templateModel {
+			cp[k] = v
+		}
+		cp["id"] = id
+		cp["root"] = "local-inference-lab/GLM-5.3-Flash-NVFP4-Spark"
+		cp["supported_reasoning_efforts"] = []string{"none", "low", "medium", "high", "max", "xhigh"}
+		if defEff, ok := gs.getModelDefaultEffort(id); ok {
+			cp["default_effort"] = defEff
+		}
+		return cp
+	}
+
+	servedList := gs.getServedModelList()
+	trimmedPath := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, "/v1/models"), "/models")
+	trimmedPath = strings.TrimPrefix(trimmedPath, "/")
+	if trimmedPath != "" {
+		if !gs.isServedModel(trimmedPath) {
+			writeOpenAIError(w, http.StatusNotFound,
+				fmt.Sprintf("The model %q does not exist (served models: %s).", trimmedPath, strings.Join(servedList, ", ")),
+				"invalid_request_error", "model", "model_not_found")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(buildEntry(trimmedPath))
+		return
+	}
+
+	outList := make([]any, 0, len(servedList))
+	for _, m := range servedList {
+		outList = append(outList, buildEntry(m))
+	}
+	parsed["data"] = outList
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(parsed)
 }
@@ -2334,27 +2725,59 @@ func main() {
 	backendURL := flag.String("backend", "", "Alias for -upstream")
 	spillDir := flag.String("spill-dir", "/tmp/spark_kv_spill", "Directory for O_DIRECT NVMe KV Spill Tier")
 	blockSize := flag.Int("block-size", DefaultBlockSizeTokens, "KV cache block size in tokens (must match B12X 256)")
+	servedModelsFlag := flag.String("served-models", "", "Comma-separated list of served model names (default: GLM-5.3-Flash or SERVED_MODEL_NAMES)")
+	aliasesConfigFlag := flag.String("aliases-config", "", "Path to runtime JSON model aliases config (default: config/model_aliases.json or SPARK_ALIASES_CONFIG)")
 	flag.Parse()
 	if *backendURL != "" {
 		*upstreamURL = *backendURL
 	}
 
+	rawServed := *servedModelsFlag
+	if rawServed == "" {
+		rawServed = os.Getenv("SERVED_MODEL_NAMES")
+	}
+	var servedList []string
+	if rawServed != "" {
+		for _, part := range strings.FieldsFunc(rawServed, func(r rune) bool { return r == ',' || r == ' ' }) {
+			if part != "" {
+				servedList = append(servedList, part)
+			}
+		}
+	}
+
+	aliasesCfgPath := *aliasesConfigFlag
+	if aliasesCfgPath == "" {
+		aliasesCfgPath = os.Getenv("SPARK_ALIASES_CONFIG")
+	}
+	if aliasesCfgPath == "" {
+		if exe, err := os.Executable(); err == nil {
+			aliasesCfgPath = filepath.Join(filepath.Dir(filepath.Dir(exe)), "config", "model_aliases.json")
+		} else {
+			aliasesCfgPath = "config/model_aliases.json"
+		}
+	}
+
 	router := NewRadixPrefixRouter(*blockSize, MaxRadixBlocks, *spillDir)
-	srv := NewGatewayServer(*upstreamURL, router)
+	srv := NewGatewayServer(*upstreamURL, router, servedList, aliasesCfgPath)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", srv.handleChatCompletions)
 	mux.HandleFunc("/v1/responses", srv.handleResponsesAPI)
 	mux.HandleFunc("/v1/messages", srv.handleAnthropicMessages)
+	mux.HandleFunc("/v1/messages/", srv.handleAnthropicMessages)
+	mux.HandleFunc("/messages", srv.handleAnthropicMessages)
+	mux.HandleFunc("/messages/", srv.handleAnthropicMessages)
 	mux.HandleFunc("/v1/models", srv.handleModels)
+	mux.HandleFunc("/v1/models/", srv.handleModels)
 	mux.HandleFunc("/models", srv.handleModels)
+	mux.HandleFunc("/models/", srv.handleModels)
 	mux.HandleFunc("/tokenize", srv.handleProxyPass)
 	mux.HandleFunc("/detokenize", srv.handleProxyPass)
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/metrics", srv.handleMetrics)
 
-	log.Printf("[spark-gateway] Starting Spark-GLM53 Go Control Plane on %s -> upstream %s (block_size=%d, spill_dir=%s)",
-		*listenAddr, *upstreamURL, *blockSize, *spillDir)
+	log.Printf("[spark-gateway] Starting Spark-GLM53 Go Control Plane on %s -> upstream %s (block_size=%d, spill_dir=%s, aliases_config=%s, served_models=%v)",
+		*listenAddr, *upstreamURL, *blockSize, *spillDir, aliasesCfgPath, srv.getServedModelList())
 	httpSrv := &http.Server{
 		Addr:              *listenAddr,
 		Handler:           mux,

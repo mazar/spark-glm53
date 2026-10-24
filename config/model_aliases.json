@@ -1,0 +1,16 @@
+{
+  "aliases": {
+    "GLM-5.3-Flash[1m]": {
+      "effort": "xhigh"
+    },
+    "GLM-5.3-Flash": {
+      "effort": "xhigh"
+    },
+    "GLM-5.3-Flash-sonnet": {
+      "effort": "medium"
+    },
+    "GLM-5.3-Flash-haiku": {
+      "effort": "low"
+    }
+  }
+}

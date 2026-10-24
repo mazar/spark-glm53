@@ -178,9 +178,26 @@ To also tear down the persistent weight daemons and free `/dev/shm`:
 
 `spark-gateway` (`:8888`) natively respects per-request thinking and effort controls across all client formats while preserving multi-turn KV prefix-cache hits:
 - **Default (`Max`):** When omitted, defaults to `<|system|>Reasoning Effort: Max` (matching the native GLM-5.3 Jinja template).
-- **Per-Request Effort (`low`, `medium`, `high`, `max`):** Pass top-level `"reasoning_effort": "low"`, `"reasoning": {"effort": "low"}`, or `"chat_template_kwargs": {"reasoning_effort": "low"}`.
-- **Disable Thinking (`none` / `enable_thinking: false`):** Pass `"reasoning_effort": "none"`, `"enable_thinking": false`, or `tool-eval-bench --no-think`. The template emits `<|assistant|><think></think>` so the model skips `<think>` and achieves **85%–98.6% `DFlash2` (`K=7`) draft acceptance** on code and structured JSON.
+- **Per-Request Effort (`low`, `medium`, `high`, `max` / `xhigh`):** Pass top-level `"reasoning_effort": "low"`, `"reasoning": {"effort": "low"}`, `"output_config": {"effort": "medium"}`, or `"chat_template_kwargs": {"reasoning_effort": "low"}`. Unknown effort values are rejected with HTTP `400`.
+- **Disable Thinking (`none` / `enable_thinking: false`):** Pass `"reasoning_effort": "none"`, `"enable_thinking": false`, `"thinking": {"type": "disabled"}`, or `tool-eval-bench --no-think`. The template emits `<|assistant|><think></think>` so the model skips `<think>` and achieves **85%–98.6% `DFlash2` (`K=7`) draft acceptance** on code and structured JSON.
 - **Guided Decoding (`response_format`):** When `response_format` (`json_schema` / `json_object`) is active on a turn, `spark-gateway` automatically closes `<think></think>` at the end of the prompt while preserving `<|system|>Reasoning Effort: Max` at token 0 so multi-turn tool $\rightarrow$ JSON workflows get a 100% KV prefix-cache hit on prior turns and emit schema-valid JSON directly into `message.content`.
+
+---
+
+## Runtime Model Aliases Configuration
+
+By default, `spark-gateway` (`:8888`) serves only `GLM-5.3-Flash` and strictly rejects requests for unserved model names with HTTP `404`. To define additional model aliases at runtime (with zero engine/gateway restarts), create or edit `config/model_aliases.json` (or pass `--served-models` / `SERVED_MODEL_NAMES`):
+
+```json
+{
+  "aliases": {
+    "GLM-5.3-Flash": { "effort": "xhigh" },
+    "GLM-5.3-Flash-sonnet": { "effort": "medium" },
+    "GLM-5.3-Flash-haiku": { "effort": "low" }
+  }
+}
+```
+`spark-gateway` watches `config/model_aliases.json` by `ModTime` and immediately advertises and serves configured aliases on `/v1/models`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, and `/v1/responses` while rejecting any model name not in the configured list.
 
 ---
 
