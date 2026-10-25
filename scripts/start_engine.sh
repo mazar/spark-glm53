@@ -137,6 +137,7 @@ if [[ -x "$ROOT_DIR/bin/spark-shm-weights" ]]; then
     docker rm -f spark-shm-weights >/dev/null 2>&1 || true
     docker run -d --name spark-shm-weights --restart unless-stopped \
       --ipc=host --privileged --ulimit memlock=-1:-1 \
+      -e "SPARK_USE_CUDA_IPC=${SPARK_USE_CUDA_IPC}" \
       -v /tmp:/tmp -v "$HOST_HOME:$HOST_HOME" \
       -v "$HOST_CACHE_DIR/huggingface:/root/.cache/huggingface" \
       --entrypoint "$ROOT_DIR/bin/spark-shm-weights" \
@@ -147,6 +148,7 @@ if [[ -x "$ROOT_DIR/bin/spark-shm-weights" ]]; then
       docker rm -f spark-shm-weights >/dev/null 2>&1 || true
       docker run -d --name spark-shm-weights --restart unless-stopped \
         --ipc=host --privileged --ulimit memlock=-1:-1 \
+        -e SPARK_USE_CUDA_IPC=${SPARK_USE_CUDA_IPC} \
         -v /tmp:/tmp -v $HOST_HOME:$HOST_HOME \
         -v $HOST_CACHE_DIR/huggingface:/root/.cache/huggingface \
         --entrypoint $ROOT_DIR/bin/spark-shm-weights \
@@ -155,8 +157,12 @@ if [[ -x "$ROOT_DIR/bin/spark-shm-weights" ]]; then
   " || true
 fi
 python3 -c '
-import os, socket
+import os, socket, time
 s = "/tmp/spark_shm_weights_rank_0.sock"
+for _ in range(20):
+    if os.path.exists(s):
+        break
+    time.sleep(0.25)
 use_ipc = os.environ.get("SPARK_USE_CUDA_IPC", "1") == "1"
 if os.path.exists(s):
     cmds = ["UNLOCK /dev/shm/glm53_dflash2.safetensors", "UNLOCK /dev/shm/glm53_rank_0.safetensors"]
@@ -172,8 +178,12 @@ if os.path.exists(s):
             print("[start_engine] Head", cmd, "->", sock.recv(4096).decode().strip())
 ' || true
 ssh -o BatchMode=yes "$WORKER_HOST" "SPARK_USE_CUDA_IPC=${SPARK_USE_CUDA_IPC} python3 -c '
-import os, socket
+import os, socket, time
 s = \"/tmp/spark_shm_weights_rank_1.sock\"
+for _ in range(20):
+    if os.path.exists(s):
+        break
+    time.sleep(0.25)
 use_ipc = os.environ.get(\"SPARK_USE_CUDA_IPC\", \"1\") == \"1\"
 if os.path.exists(s):
     cmds = [\"UNLOCK /dev/shm/glm53_dflash2.safetensors\", \"UNLOCK /dev/shm/glm53_rank_1.safetensors\"]
