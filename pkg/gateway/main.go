@@ -466,28 +466,8 @@ type ReasoningConfig struct {
 }
 
 var (
-	thinkTagRegex       = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
-	cachedJinjaTemplate string
+	thinkTagRegex = regexp.MustCompile(`(?s)<think>.*?</think>\s*`)
 )
-
-func init() {
-	candidates := []string{
-		os.Getenv("SPARK_CHAT_TEMPLATE"),
-		"worker/glm53_chat_template.jinja",
-	}
-	if exe, err := os.Executable(); err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "..", "worker", "glm53_chat_template.jinja"))
-	}
-	for _, p := range candidates {
-		if p == "" {
-			continue
-		}
-		if b, err := os.ReadFile(p); err == nil && len(b) > 0 {
-			cachedJinjaTemplate = string(b)
-			break
-		}
-	}
-}
 
 func parseKnownEffort(raw string) (effort string, enableThinking bool, valid bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -588,9 +568,6 @@ func NormalizeReasoningAndMessages(reqMap map[string]any) (ReasoningConfig, erro
 		cfg.EnableThinking = false
 		ctk["keep_reasoning_header"] = true
 		ctk["reasoning_effort"] = cfg.Effort
-		if cachedJinjaTemplate != "" && reqMap["chat_template"] == nil {
-			reqMap["chat_template"] = cachedJinjaTemplate
-		}
 	}
 
 	if v, ok := reqMap["clear_thinking"].(bool); ok {
