@@ -399,10 +399,6 @@ def register_and_map_shm_safetensors(shm_path: str, device_index: int = 0) -> di
         os.close(fd)
 
         cpu_buf = torch.frombuffer(mm, dtype=torch.uint8)
-        try:
-            _libc.madvise(ctypes.c_void_p(cpu_buf.data_ptr()), ctypes.c_size_t(file_size), ctypes.c_int(MADV_HUGEPAGE))
-        except Exception:
-            pass
 
         header_len = struct.unpack("<Q", mm[:8])[0]
         header = json.loads(mm[8 : 8 + header_len].decode("utf-8"))
@@ -582,10 +578,6 @@ def export_and_rebind_model_to_shm(model: nn.Module, shm_path: str, rank: int = 
     os.close(fd)
 
     cpu_buf = torch.frombuffer(mm, dtype=torch.uint8)
-    try:
-        _libc.madvise(ctypes.c_void_p(cpu_buf.data_ptr()), ctypes.c_size_t(total_file_size), ctypes.c_int(MADV_HUGEPAGE))
-    except Exception:
-        pass
 
     mm[:8] = struct.pack("<Q", header_len)
     mm[8:data_start] = header_json
@@ -598,7 +590,7 @@ def export_and_rebind_model_to_shm(model: nn.Module, shm_path: str, rank: int = 
             storage_refs[sptr] = storage_refs.get(sptr, 0) + 1
 
     try:
-        # Lockstep copy from CUDA tensor -> /dev/shm mmap and immediate resize_(0) + empty_cache()
+        # Lockstep copy from CUDA tensor -> CPU staging tensor -> /dev/shm mmap and immediate resize_(0) + empty_cache()
         freed_since_flush = 0
         flush_threshold = 2 * 1024 * 1024 * 1024  # 2 GiB
         for name, tensor, _ in items_to_export:
@@ -606,10 +598,10 @@ def export_and_rebind_model_to_shm(model: nn.Module, shm_path: str, rank: int = 
             nbytes = end_off - start_off
             if nbytes > 0:
                 sptr = tensor.untyped_storage().data_ptr()
-                src_u8 = tensor.detach().contiguous().reshape(-1).view(torch.uint8)
+                src_cpu = tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu()
                 dst_u8 = cpu_buf[data_start + start_off : data_start + end_off]
-                dst_u8.copy_(src_u8, non_blocking=False)
-                del src_u8
+                dst_u8.copy_(src_cpu, non_blocking=False)
+                del src_cpu
                 storage_refs[sptr] = storage_refs.get(sptr, 1) - 1
                 if storage_refs[sptr] <= 0:
                     try:

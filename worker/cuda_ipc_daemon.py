@@ -283,6 +283,7 @@ def run_daemon(rank: int, shm_path: str, ipc_json_path: str, sock_path: str, sla
         json.dump(payload, f)
     os.chmod(tmp_json, 0o666)
     os.replace(tmp_json, ipc_json_path)
+    _unlock_shmdaemon(shm_path, rank)
 
     mem_after = _read_meminfo_gib()
     elapsed = time.perf_counter() - t0

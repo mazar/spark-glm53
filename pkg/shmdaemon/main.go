@@ -75,9 +75,6 @@ static int odirect_copy_to_shm(const char* src_path, const char* dst_shm_path, s
         close(src_fd);
         return -1;
     }
-#ifdef MADV_HUGEPAGE
-    madvise(dst_map, file_size, MADV_HUGEPAGE);
-#endif
 
     const size_t align = 4096;
     const size_t chunk_size = 8 * 1024 * 1024; // 8 MiB
@@ -190,9 +187,6 @@ static int pin_shm_file(const char* shm_path, shm_pin_t* out_pin, char* err_buf,
         close(fd);
         return -1;
     }
-#ifdef MADV_HUGEPAGE
-    madvise(addr, sz, MADV_HUGEPAGE);
-#endif
     int locked = 0;
     if (mlock(addr, sz) == 0) {
         locked = 1;
@@ -260,23 +254,32 @@ type DaemonStatus struct {
 }
 
 type ShmDaemon struct {
-	mu         sync.Mutex
-	rank       int
-	socketPath string
-	segments   map[string]*PinnedSegment
+	mu           sync.Mutex
+	rank         int
+	socketPath   string
+	segments     map[string]*PinnedSegment
+	manualUnlock map[string]bool
 }
 
 func NewShmDaemon(rank int, socketPath string) *ShmDaemon {
 	return &ShmDaemon{
-		rank:       rank,
-		socketPath: socketPath,
-		segments:   make(map[string]*PinnedSegment),
+		rank:         rank,
+		socketPath:   socketPath,
+		segments:     make(map[string]*PinnedSegment),
+		manualUnlock: make(map[string]bool),
 	}
+}
+
+func (d *ShmDaemon) IsManuallyUnlocked(shmPath string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.manualUnlock[shmPath]
 }
 
 func (d *ShmDaemon) LockSegment(shmPath string) (*PinnedSegment, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	delete(d.manualUnlock, shmPath)
 
 	if existing, ok := d.segments[shmPath]; ok {
 		if fi, err := os.Stat(shmPath); err == nil && uint64(fi.Size()) == existing.SizeBytes && existing.Locked {
@@ -335,6 +338,7 @@ func (d *ShmDaemon) LoadAndLockFile(srcPath, dstShmPath string) (*PinnedSegment,
 func (d *ShmDaemon) UnlockSegment(shmPath string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.manualUnlock[shmPath] = true
 	if seg, ok := d.segments[shmPath]; ok {
 		C.unpin_shm_file(&seg.cPin)
 		delete(d.segments, shmPath)
@@ -489,42 +493,6 @@ func main() {
 
 	daemon := NewShmDaemon(*rank, *socketPath)
 
-	// 1. Load incoai/GLM-5.3-Flash-DFlash2 via O_DIRECT into /dev/shm/glm53_dflash2.safetensors and mlock() it
-	if dfSrc := findDFlash2Safetensors(*dflashPath); dfSrc != "" {
-		if _, err := daemon.LoadAndLockFile(dfSrc, *dflashShmPath); err != nil {
-			log.Printf("[spark-shm-weights rank=%d] Warning: DFlash2 O_DIRECT load failed: %v", *rank, err)
-		}
-	}
-
-	// 2. If /dev/shm/glm53_rank_<rank>.safetensors already exists (and is not migrated to CUDA IPC), pin it immediately with mlock()
-	if _, ipcErr := os.Stat(*rankShmPath + ".cudaipc.json"); os.IsNotExist(ipcErr) {
-		if fi, err := os.Stat(*rankShmPath); err == nil && fi.Size() > 0 {
-			if _, err := daemon.LockSegment(*rankShmPath); err != nil {
-				log.Printf("[spark-shm-weights rank=%d] Warning: locking %s failed: %v", *rank, *rankShmPath, err)
-			}
-		}
-	}
-
-	// 3. Background watcher: if /dev/shm/glm53_rank_<rank>.safetensors appears later (and is non-sparse and not CUDA IPC), automatically lock it
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			if _, ipcErr := os.Stat(*rankShmPath + ".cudaipc.json"); ipcErr == nil {
-				continue
-			}
-			if fi, err := os.Stat(*rankShmPath); err == nil && fi.Size() > 1024*1024*1024 {
-				if sysSt, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(sysSt.Blocks)*512 < (uint64(fi.Size())*9)/10 {
-					continue
-				}
-				st := daemon.Status()
-				if seg, ok := st.Segments[*rankShmPath]; !ok || seg.SizeBytes != uint64(fi.Size()) {
-					_, _ = daemon.LockSegment(*rankShmPath)
-				}
-			}
-		}
-	}()
-
 	_ = os.Remove(*socketPath)
 	ln, err := net.Listen("unix", *socketPath)
 	if err != nil {
@@ -532,6 +500,66 @@ func main() {
 	}
 	_ = os.Chmod(*socketPath, 0666)
 	log.Printf("[spark-shm-weights rank=%d] Listening on %s (watching %s)", *rank, *socketPath, *rankShmPath)
+
+	// 1. Load incoai/GLM-5.3-Flash-DFlash2 via O_DIRECT into /dev/shm/glm53_dflash2.safetensors only when CUDA IPC is disabled
+	if os.Getenv("SPARK_USE_CUDA_IPC") == "0" {
+		if dfSrc := findDFlash2Safetensors(*dflashPath); dfSrc != "" {
+			if _, err := daemon.LoadAndLockFile(dfSrc, *dflashShmPath); err != nil {
+				log.Printf("[spark-shm-weights rank=%d] Warning: DFlash2 O_DIRECT load failed: %v", *rank, err)
+			}
+		}
+	}
+
+	// 2. If /dev/shm/glm53_rank_<rank>.safetensors already exists (and is non-sparse and not migrated to CUDA IPC), pin it with mlock()
+	if os.Getenv("SPARK_USE_CUDA_IPC") == "0" {
+		if _, ipcErr := os.Stat(*rankShmPath + ".cudaipc.json"); os.IsNotExist(ipcErr) {
+			if fi, err := os.Stat(*rankShmPath); err == nil && fi.Size() > 0 {
+				if sysSt, ok := fi.Sys().(*syscall.Stat_t); !ok || uint64(sysSt.Blocks)*512 >= (uint64(fi.Size())*9)/10 {
+					if _, err := daemon.LockSegment(*rankShmPath); err != nil {
+						log.Printf("[spark-shm-weights rank=%d] Warning: locking %s failed: %v", *rank, *rankShmPath, err)
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Background watcher: automatically unpin sparse/deleted/CUDA-IPC files, and auto-lock non-sparse /dev/shm files unless manually unlocked
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			st := daemon.Status()
+			if _, ok := st.Segments[*dflashShmPath]; ok {
+				if _, err := os.Stat(*dflashShmPath); os.IsNotExist(err) {
+					daemon.UnlockSegment(*dflashShmPath)
+				}
+			}
+			if _, ipcErr := os.Stat(*rankShmPath + ".cudaipc.json"); ipcErr == nil {
+				if _, ok := st.Segments[*rankShmPath]; ok {
+					daemon.UnlockSegment(*rankShmPath)
+				}
+				continue
+			}
+			fi, err := os.Stat(*rankShmPath)
+			if err != nil {
+				if _, ok := st.Segments[*rankShmPath]; ok {
+					daemon.UnlockSegment(*rankShmPath)
+				}
+				continue
+			}
+			if sysSt, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(sysSt.Blocks)*512 < (uint64(fi.Size())*9)/10 {
+				if _, ok := st.Segments[*rankShmPath]; ok {
+					daemon.UnlockSegment(*rankShmPath)
+				}
+				continue
+			}
+			if os.Getenv("SPARK_USE_CUDA_IPC") == "0" && !daemon.IsManuallyUnlocked(*rankShmPath) && fi.Size() > 1024*1024*1024 {
+				if seg, ok := st.Segments[*rankShmPath]; !ok || seg.SizeBytes != uint64(fi.Size()) {
+					_, _ = daemon.LockSegment(*rankShmPath)
+				}
+			}
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
